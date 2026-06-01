@@ -609,17 +609,13 @@ plotTargetFRegu = function (x.points, targetFValues, reguValues, targetFErrorVal
 # Inspired by Ajay Shah Plot 2 time series with different y axes (left and right),
 # in https://stat.ethz.ch/pipermail/r-help/2004-March/047775.html)
 
-
-
 plot.y2 <- function(x, yright, yleft, 
                     yright2 = NULL, yleft2 = NULL, numLines = NULL,
                     xlab = NULL, yylab = c("", ""), col = c(1, 2),
                     type = c(16, 16), lwd = c(1, 1), main = NULL,
-                    #Standard error en series temporales
                     yrightErrorValues = NULL, yleftErrorValues = NULL,
-                    group_names = NULL, size = 3, breakby = c(0.2,0.3)) {
+                    group_names = NULL, size = 3, breakby = c(0.2, 0.3)) {
   
-  # Creating a data frame inside the function
   data <- data.frame(x = x, yright = yright, yleft = yleft)
   
   if (!is.null(yrightErrorValues)) data$yrightErrorValues <- yrightErrorValues
@@ -627,79 +623,88 @@ plot.y2 <- function(x, yright, yleft,
   if (!is.null(yright2)) data$yright2 <- yright2
   if (!is.null(yleft2)) data$yleft2 <- yleft2
   
+  min_L_data = min(data$yleft, na.rm = TRUE)
+  max_L_data = max(data$yleft, na.rm = TRUE)
+  min_R_data = min(data$yright, na.rm = TRUE)
+  max_R_data = max(data$yright, na.rm = TRUE)
+  
+  scale_R_to_L <- function(val) {
+    (val - min_R_data) / (max_R_data - min_R_data) * (max_L_data - min_L_data) + min_L_data
+  }
+  
+  if (!is.null(yleftErrorValues)) {
+    lowest_L = min(data$yleft - data$yleftErrorValues, na.rm = TRUE)
+    highest_L = max(data$yleft + data$yleftErrorValues, na.rm = TRUE)
+  } else {
+    lowest_L = min_L_data; highest_L <- max_L_data
+  }
+  
+  if (!is.null(yrightErrorValues)) {
+    lowest_R_mapped <- scale_R_to_L(min(data$yright - data$yrightErrorValues, na.rm = TRUE))
+    highest_R_mapped <- scale_R_to_L(max(data$yright + data$yrightErrorValues, na.rm = TRUE))
+  } else {
+    lowest_R_mapped <- min_L_data; highest_R_mapped <- max_L_data
+  }
+  
+  y_minreg = min(lowest_L, lowest_R_mapped) - (breakby[1] * 0.2)
+  y_maxreg = max(highest_L, highest_R_mapped) + (breakby[1] * 0.2)
+  
+  y_min = min_R_data - (min_L_data - y_minreg) * (max_R_data - min_R_data) / (max_L_data - min_L_data)
+  y_max = max_R_data + (y_maxreg - max_L_data) * (max_R_data - min_R_data) / (max_L_data - min_L_data)
+  
+  # Base Plot Setup 
   p <- ggplot(data, aes(x = x)) +
+    # Left axis (Primary) background
+    geom_point(aes(y = yleft), color = col[2], shape = type[1], size = 2, alpha = 0.4) +
+    geom_line(aes(y = yleft), color = col[2], linewidth = lwd[1], alpha = 0.2) +
     
-    # Left axis (Primary y-axis)
-    geom_point(aes(y = yleft), color = col[2], shape = type[1], size = 2, alpha=0.4) +
-    geom_line(aes(y = yleft), color = col[2], linewidth = lwd[1], alpha=0.2) +
+    # Right axis (Secondary) background using precise scale formula
+    geom_point(aes(y = scale_R_to_L(yright)), color = col[1], shape = type[2], size = 2, alpha = 0.4) +
+    geom_line(aes(y = scale_R_to_L(yright)), color = col[1], linewidth = lwd[2], alpha = 0.2) +
     
-    # Right axis (Secondary y-axis, rescaled to match yright values)
-    geom_point(aes(y = (yright - min(yright)) / (max(yright) - min(yright)) * (max(yleft) - min(yleft)) + min(yleft)), color = col[1], shape = type[2], size = 2, alpha=0.4) +
-    geom_line(aes(y = (yright - min(yright)) / (max(yright) - min(yright)) * (max(yleft) - min(yleft)) + min(yleft)), color = col[1], linewidth = lwd[2], alpha=0.2) +
-    
-    # Labels and Theme
     labs(x = "", y = yylab[2], title = main) +
-    scale_y_continuous(
-      limits = range(data$yleft),
-      breaks = seq(min(data$yleft), max(data$yleft), by = breakby[1]),
-      labels =  function(x) sprintf("%.1f", x),
-      sec.axis = sec_axis(
-        transform = ~ . * (max(data$yright) - min(data$yright)) / (max(data$yleft) - min(data$yleft)) + min(data$yright) - min(data$yleft) * (max(data$yright) - min(data$yright)) / (max(data$yleft) - min(data$yleft)),
-        breaks = seq(min(data$yright), max(data$yright), by = breakby[2]),  # Right y-axis ticks (adjust the step size if needed)
-        labels = function(x) sprintf("%.1f", x), 
-        name = yylab[1]
-      )
-    ) +
-    # Modify x-axis to show custom labels
-    scale_x_continuous(
-      breaks = data$x, # Set x breaks to be the data points
-      labels = rownames(data) # Use combined labels for x-axis
-    ) +
+    scale_x_continuous(breaks = data$x, labels = rownames(data)) +
     theme_minimal() +
     theme(
-      axis.title.y = element_text(color = col[2]), # Set left y-axis label color
-      axis.title.y.right = element_text(
-        color = col[1], 
-        angle = 90    ), # Set right y-axis label color
-      panel.grid.major = element_blank(), # Remove major grid lines
-      panel.grid.minor = element_blank(),  # Remove minor grid lines
+      axis.title.y = element_text(color = col[2]), 
+      axis.title.y.right = element_text(color = col[1], angle = 90), 
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),  
       panel.border = element_rect(color = 'black', fill = NA, linewidth = 0.5),
       axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = size),
       axis.text.y = element_text(angle = 90, hjust = 1, vjust = 0.5),
-      axis.ticks.x = element_line(color = "black", linewidth  = 0.5),
-      axis.ticks.y = element_line(color = "black", linewidth  = 0.5),
+      axis.ticks.x = element_line(color = "black", linewidth = 0.5),
+      axis.ticks.y = element_line(color = "black", linewidth = 0.5),
       plot.title = element_text(hjust = 0.5)
     )
   
-  if(!is.null(yright2)){
-    # Plot the spline for yleft (Primary y-axis)
-    p = p + 
-      geom_line(aes(y = yleft2), color = col[2], linewidth = 1) +
-      
-      # Plot the spline for yright (Secondary y-axis)
-      geom_line(aes(y = (yright2 - min(yright2)) / (max(yright2) - min(yright2)) * (max(yleft) - min(yleft)) + min(yleft)), color = col[1], linewidth = lwd[1])
-    
-  } else{
-    p = p + geom_point(aes(y = yleft), color = col[2], shape = type[1], size = 2) +
+  if (!is.null(yright2)) {
+    p <- p + geom_line(aes(y = yleft2), color = col[2], linewidth = 1) +
+      geom_line(aes(y = scale_R_to_L(yright2)), color = col[1], linewidth = lwd[1])
+  } else {
+    p <- p + geom_point(aes(y = yleft), color = col[2], shape = type[1], size = 2) +
       geom_line(aes(y = yleft), color = col[2], linewidth = lwd[1]) +
-      # Right axis (Secondary y-axis, rescaled to match yright values)
-      geom_point(aes(y = (yright - min(yright)) / (max(yright) - min(yright)) * (max(yleft) - min(yleft)) + min(yleft)), color = col[1], shape = type[2], size = 2, alpha=0.4) +
-      geom_line(aes(y = (yright - min(yright)) / (max(yright) - min(yright)) * (max(yleft) - min(yleft)) + min(yleft)), color = col[1], linewidth = lwd[2]) 
+      geom_point(aes(y = scale_R_to_L(yright)), color = col[1], shape = type[2], size = 2) +
+      geom_line(aes(y = scale_R_to_L(yright)), color = col[1], linewidth = lwd[2]) 
+  }
+  
+  if (!is.null(yleftErrorValues)) {
+    p <- p + geom_errorbar(aes(ymin = yleft - yleftErrorValues, ymax = yleft + yleftErrorValues), 
+                           width = 0.2, color = col[2])
+  }
+  
+  if (!is.null(yrightErrorValues)) {
+    p <- p + geom_errorbar(aes(
+      ymin = scale_R_to_L(yright - yrightErrorValues),
+      ymax = scale_R_to_L(yright + yrightErrorValues)
+    ), width = 0.2, color = col[1])
   }
   
   if (!is.null(group_names)) {
-    
-    if (!is.null(yleftErrorValues)) {
-      y_max_total <- max(data$yleft + yleftErrorValues, na.rm = TRUE)
-    } else {
-      y_max_total <- max(data$yleft, na.rm = TRUE)
-    }
-    
-    y_text = y_max_total
-    # 3. Calculate horizontal centers
-    num_groups = length(group_names)
-    group_position = seq(min(data$x), max(data$x), length.out = num_groups + 1)
-    group_centers = head(group_position, -1) + diff(group_position) / 2
+    y_text <- y_maxreg - (breakby[1] * 0.1) # Position label slightly under top border
+    num_groups <- length(group_names)
+    group_position <- seq(min(data$x), max(data$x), length.out = num_groups + 1)
+    group_centers <- head(group_position, -1) + diff(group_position) / 2
     
     group_labels_df <- data.frame(
       x = group_centers,
@@ -707,48 +712,21 @@ plot.y2 <- function(x, yright, yleft,
       label = group_names
     )
     
-    p = p + geom_vline(xintercept = numLines, color = "black", linetype = "dashed", linewidth = 0.5) + # Dynamically add the group names above the plot
-      geom_text(data = group_labels_df, aes(x = x, y = y, label = label), vjust = 1, color = "black", size = 3) 
-    
+    p <- p + geom_vline(xintercept = numLines, color = "black", linetype = "dashed", linewidth = 0.5) + 
+      geom_text(data = group_labels_df, aes(x = x, y = y, label = label), vjust = 1, color = "black", size = 3)  
   }
   
-  if(!is.null(yrightErrorValues) && !is.null(yleftErrorValues)){
-    
-    
-    y_min = min(targetFValues - yrightErrorValues, na.rm = TRUE)
-    y_max = max(targetFValues + yrightErrorValues, na.rm = TRUE)
-    
-    y_minreg = min(reguValues - yleftErrorValues, na.rm = TRUE)
-    y_maxreg = max(reguValues + yleftErrorValues, na.rm = TRUE)
-    
-    p = p + geom_point(aes(y = yleft), color = col[2], shape = type[1], size = 2) +
-      geom_line(aes(y = yleft), color = col[2], linewidth = lwd[1]) +
-      
-      # Right axis (Secondary y-axis, rescaled to match yright values)
-      geom_point(aes(y = (yright - min(yright)) / (max(yright) - min(yright)) * (max(yleft) - min(yleft)) + min(yleft)), color = col[1], shape = type[2], size = 2) +
-      geom_line(aes(y = (yright - min(yright)) / (max(yright) - min(yright)) * (max(yleft) - min(yleft)) + min(yleft)), color = col[1], linewidth = lwd[2]) +
-      
-      # Adjust the axis to include the error value
-      geom_errorbar(aes(ymin = yleft - yleftErrorValues, ymax = yleft + yleftErrorValues), 
-                    width = 0.2, color = col[2]) +
-      geom_errorbar(aes(
-        ymin = (yright - yrightErrorValues - min(yright, na.rm = TRUE)) / (max(yright,na.rm = TRUE) - min(yright,na.rm = TRUE)) * (max(yleft,na.rm = TRUE) - min(yleft,na.rm = TRUE)) + min(yleft,na.rm = TRUE),
-        ymax = (yright + yrightErrorValues - min(yright, na.rm = TRUE)) / (max(yright,na.rm = TRUE) - min(yright,na.rm = TRUE)) * (max(yleft,na.rm = TRUE) - min(yleft, na.rm = TRUE)) + min(yleft,na.rm = TRUE)
-      ), width = 0.2, color = col[1]) +
-      
-      scale_y_continuous(
-        limits = c(y_minreg, y_maxreg),   # Expand the limits
-        breaks = seq(y_minreg, y_maxreg, by = breakby[1]),
-        labels = function(x) sprintf("%.1f", x),
-        sec.axis = sec_axis(
-          transform = ~ . * (y_max - y_min) / (y_maxreg - y_minreg) + y_min - y_minreg * (y_max - y_min) / (y_maxreg - y_minreg),
-          breaks = seq(y_min, y_max, by = breakby[2]),
-          labels = function(x) sprintf("%.1f", x), 
-          name = targetF
-        )
-      )
-    
-  }
+  p <- p + scale_y_continuous(
+    limits = c(y_minreg, y_maxreg),   
+    breaks = seq(y_minreg, y_maxreg, by = breakby[1]),
+    labels = function(x) sprintf("%.1f", x),
+    sec.axis = sec_axis(
+      transform = ~ . * (max_R_data - min_R_data) / (max_L_data - min_L_data) + min_R_data - min_L_data * (max_R_data - min_R_data) / (max_L_data - min_L_data),
+      breaks = seq(y_min, y_max, by = breakby[2]),
+      labels = function(x) sprintf("%.1f", x), 
+      name = yylab[1]
+    )
+  )
   
   return(p)
 }
