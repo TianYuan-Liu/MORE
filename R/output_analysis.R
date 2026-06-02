@@ -2542,17 +2542,16 @@ networkMORE <- function(outputRegpcond, cytoscape = TRUE, group1 = NULL, group2 
     df = df[which(abs(df[,4])>=qc),,drop=FALSE]
     
     # Define unique names
-    df = df %>% mutate(regomic = paste(omic, regulator, sep = "_"))
+    df$regomic <- paste(df$omic, df$regulator, sep = "_")
     #Data.frame of that network
     nodes = data.frame(id = c(unique(df[,'targetF']),unique(df[,"regomic"])),
                        omic = c(rep('targetF',length(unique(df[,'targetF']))),unique(df[,c('regomic','omic')])[,2]))
     # Filter targetF if duplicates
-    nodes = nodes %>% 
-      rowwise() %>%
-      mutate(label = sub(paste0(omic, "_"), "", id)) %>%
-      group_by(label) %>%
-      filter(!(n() == 2 & (omic == "targetF"))) %>%
-      ungroup()
+    
+    prefix_lengths <- nchar(nodes$omic) + 2 
+    nodes$label <- substr(nodes$id, prefix_lengths, nchar(nodes$id))
+    label_counts <- ave(seq_len(nrow(nodes)), nodes$label, FUN = length)
+    nodes <- nodes[!(label_counts == 2 & nodes$omic == "targetF"), ]
     
     # Update the interactions if 'targetF' has been renamed.
     mapeo_ids <- nodes$id
@@ -2689,17 +2688,15 @@ networkMORE <- function(outputRegpcond, cytoscape = TRUE, group1 = NULL, group2 
       df = DifLineType(df)
       
       # Define unique names
-      df = df %>% mutate(regomic = paste(omic, regulator, sep = "_"))
+      df$regomic <- paste(df$omic, df$regulator, sep = "_")
       #Data.frame of that network
       nodes = data.frame(id = c(unique(df[,'targetF']),unique(df[,"regomic"])),
                          omic = c(rep('targetF',length(unique(df[,'targetF']))),unique(df[,c('regomic','omic')])[,2]))
       # Filter targetF if duplicates
-      nodes = nodes %>% 
-        rowwise() %>%
-        mutate(label = sub(paste0(omic, "_"), "", id)) %>%
-        group_by(label) %>%
-        filter(!(n() == 2 & (omic == "targetF"))) %>%
-        ungroup()
+      prefix_lengths <- nchar(nodes$omic) + 2 
+      nodes$label <- substr(nodes$id, prefix_lengths, nchar(nodes$id))
+      label_counts <- ave(seq_len(nrow(nodes)), nodes$label, FUN = length)
+      nodes <- nodes[!(label_counts == 2 & nodes$omic == "targetF"), ]
       
       # Update the interactions if 'targetF' has been renamed.
       mapeo_ids <- nodes$id
@@ -2822,17 +2819,15 @@ networkMORE <- function(outputRegpcond, cytoscape = TRUE, group1 = NULL, group2 
       df = DifLineType(df)
       
       # Define unique names
-      df = df %>% mutate(regomic = paste(omic, regulator, sep = "_"))
+      df$regomic <- paste(df$omic, df$regulator, sep = "_")
       #Data.frame of that network
       nodes = data.frame(id = c(unique(df[,'targetF']),unique(df[,"regomic"])),
                          omic = c(rep('targetF',length(unique(df[,'targetF']))),unique(df[,c('regomic','omic')])[,2]))
       # Filter targetF if duplicates
-      nodes = nodes %>% 
-        rowwise() %>%
-        mutate(label = sub(paste0(omic, "_"), "", id)) %>%
-        group_by(label) %>%
-        filter(!(n() == 2 & (omic == "targetF"))) %>%
-        ungroup()
+      prefix_lengths <- nchar(nodes$omic) + 2 
+      nodes$label <- substr(nodes$id, prefix_lengths, nchar(nodes$id))
+      label_counts <- ave(seq_len(nrow(nodes)), nodes$label, FUN = length)
+      nodes <- nodes[!(label_counts == 2 & nodes$omic == "targetF"), ]
       
       # Update the interactions if 'targetF' has been renamed.
       mapeo_ids <- nodes$id
