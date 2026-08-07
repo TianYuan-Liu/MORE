@@ -411,14 +411,28 @@ correlations are not the problem; its *component handling* is. A single pass
 that rejects any component failing `nedges == csize*(csize-1)/2` finds nothing,
 where R arrives at six small cliques.
 
-The obvious reconciliation is that R decomposes or peels large components rather
-than discarding them — `GetMLR` calls `CollinearityFilter1` at `MORE_MLR.R:609`
-and the surviving representative re-enters the regulator table, so repeated
-application is plausible. **That is explicitly a hypothesis and is recorded as
-one.** Three previous mechanism guesses on this path were reasoned from the R
-source and two were wrong; the only one that moved the number came from a
-measurement. Verify by instrumenting how many times `CollinearityFilter1` runs
-per target and what `mycor` contains on each pass, before changing any code.
+The obvious reconciliation was that R peels large components across repeated
+applications. **That hypothesis is FALSIFIED.** `MORE_MLR.R:606-611` calls
+`CollinearityFilter1` exactly once per target, guarded only by
+`ncol(res$RegulatorMatrix) > 1` — there is no loop and no re-entry. R produces
+all six cliques in a single pass.
+
+That relocates the defect to the graph itself. For R to obtain six *complete*
+components in one pass, its `|r| >= 0.7` graph must be close to six disjoint
+cliques (sizes 2-4 imply roughly 19 edges, against the 21 measured). The port
+sees 21 edges over the same 20 nodes and yields **zero** complete components,
+which is what happens when a handful of extra edges bridge otherwise-disjoint
+cliques into one large non-complete blob that the completeness test then rejects
+wholesale.
+
+So the next step is a direct comparison of the **edge sets**, not of the
+grouping logic: dump R's `mycor` (the pairs surviving `abs(r) >= correlation`)
+and the port's adjacency list for the same target, and diff them. If the port
+has strictly more edges, the correlation values or the comparison boundary
+differ; if the edge sets match, the component/completeness handling is at fault
+after all. Do not change code before that diff exists — three mechanism guesses
+on this path have been reasoned from the source and two were wrong, and this one
+was killed by reading the call site rather than by reasoning about it.
 
 ## 5. Output contract (`runMORE.R:501-602`)
 
