@@ -425,14 +425,40 @@ which is what happens when a handful of extra edges bridge otherwise-disjoint
 cliques into one large non-complete blob that the completeness test then rejects
 wholesale.
 
-So the next step is a direct comparison of the **edge sets**, not of the
-grouping logic: dump R's `mycor` (the pairs surviving `abs(r) >= correlation`)
-and the port's adjacency list for the same target, and diff them. If the port
-has strictly more edges, the correlation values or the comparison boundary
-differ; if the edge sets match, the component/completeness handling is at fault
-after all. Do not change code before that diff exists — three mechanism guesses
-on this path have been reasoned from the source and two were wrong, and this one
-was killed by reading the call site rather than by reasoning about it.
+### 4.8 The clique code is exonerated; the INPUT matrix is the suspect
+
+The edge-set diff was done, in R, using R's own `igraph` calls on the raw
+regulator matrix from the probe:
+
+```
+edges: 21    components: 1    sizes: 20    complete components: 0 of 1
+```
+
+So R's *algorithm*, applied to the raw regulator matrix, collapses **nothing** —
+byte-identical in outcome to this port, which also finds zero groups on that
+matrix. The port's correlation, threshold, component and completeness logic all
+agree with R's on that input.
+
+But R's actual run over the same job produced **six** groups
+(`TF_mc1_1_R` … `TF_mc1_6_R`). Both statements are measured. The only way both
+hold is that `CollinearityFilter1` is **not** receiving the raw regulator
+matrix.
+
+That narrows the remaining work sharply, and away from `collinearity.rs`:
+
+* `res$RegulatorMatrix` comes from `RemovedRegulators`, which builds it as
+  `t(data.omics[[ov]][regmodel, , drop = FALSE])` per omic and `cbind`s the
+  blocks. Confirm the column set and orientation the port reproduces.
+* `CollinearityFilter1` correlates `scale(data, scale, center)` — Pearson is
+  scale-invariant, so this cannot be the difference, and is ruled out.
+* The correlation *kind* is chosen per pair by `omicType`. If `more()`'s `isBin`
+  inferred the omic as **binary**, R uses `psych::phi` on a contingency table
+  rather than Pearson, producing a completely different graph — while this port
+  skips binary pairs entirely and reports zero groups. This is the single
+  highest-value thing to check first: dump `omicType` from the R run.
+
+Do not touch `collinearity.rs` until the input matrix and `omicType` have been
+compared. The grouping logic itself is now evidence-backed as correct.
 
 ## 5. Output contract (`runMORE.R:501-602`)
 
