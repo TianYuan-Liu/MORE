@@ -63,11 +63,34 @@ fn soft(z: f64, g: f64) -> f64 {
 ///
 /// Objective, matching glmnet with `standardize = FALSE` and a gaussian family:
 /// `1/(2n)||y - b0 - Xb||^2 + lambda*(alpha*|b|_1 + (1-alpha)/2*|b|^2)`.
+///
+/// glmnet's Fortran solves this on `y` divided by its population standard
+/// deviation `ys`, then multiplies both the coefficients and the reported
+/// lambdas by `ys` on the way out. Undoing that rescaling is *not* symmetric
+/// between the two penalties:
+///
+/// ```text
+/// b_k = ys * soft(rho/ys, lambda_int*alpha) / (xv_k + lambda_int*(1-alpha))
+///     =      soft(rho,    lambda_R*alpha)   / (xv_k + lambda_R*(1-alpha)/ys)
+/// ```
+///
+/// The L1 threshold comes out unchanged, so `lambda_max` agrees with glmnet
+/// to every printed digit even when the ridge term is wrong — which is
+/// exactly how a factor-of-`ys` error in the L2 term hid here. Pass `ys`, not
+/// 1.0, or the solver converges cleanly to the wrong optimum and tightening
+/// `thresh` moves the answer *away* from R.
+///
+/// `thresh` is likewise the already-rescaled tolerance: glmnet tests
+/// `max_j xv_j*delta_j^2 < thresh` in its internal units, so the caller
+/// multiplies by `ys^2`. The criterion is quadratic in `delta`; a
+/// square-rooted version converges far tighter than glmnet and shifts where
+/// the path stops.
 fn descend(
     x: &Mat,
     y: &[f64],
     alpha: f64,
     lambda: f64,
+    ys: f64,
     beta: &mut [f64],
     xx: &[f64],
     thresh: f64,
@@ -86,17 +109,25 @@ fn descend(
     }
 
     let l1 = lambda * alpha;
-    let l2 = lambda * (1.0 - alpha);
+    let l2 = lambda * (1.0 - alpha) / ys;
 
-    for _ in 0..max_iter {
-        let mut max_change = 0.0f64;
+    // glmnet's active set is every variable that has *ever* been nonzero on
+    // this path, not the currently nonzero ones — entries are never dropped.
+    let mut ever_active: Vec<bool> = beta.iter().map(|b| *b != 0.0).collect();
+
+    // One Gauss-Seidel sweep. Returns glmnet's `dlx`.
+    let mut sweep = |beta: &mut [f64],
+                     r: &mut Vec<f64>,
+                     ever_active: &mut Vec<bool>,
+                     active_only: bool| -> f64 {
+        let mut dlx = 0.0f64;
         for j in 0..p {
-            if xx[j] == 0.0 {
+            if xx[j] == 0.0 || (active_only && !ever_active[j]) {
                 continue;
             }
             let old = beta[j];
             // Partial residual correlation for coordinate j.
-            let rho = dot(x.col(j), &r) / n + (xx[j] / n) * old;
+            let rho = dot(x.col(j), r) / n + (xx[j] / n) * old;
             let new = soft(rho, l1) / (xx[j] / n + l2);
             if new != old {
                 let delta = new - old;
@@ -104,11 +135,31 @@ fn descend(
                     *ri -= delta * xv;
                 }
                 beta[j] = new;
-                max_change = max_change.max(delta.abs() * (xx[j] / n).sqrt());
+                if new != 0.0 {
+                    ever_active[j] = true;
+                }
+                dlx = dlx.max((xx[j] / n) * delta * delta);
             }
         }
-        if max_change < thresh {
+        dlx
+    };
+
+    // The Fortran's two-level schedule: a full sweep, and if it did not
+    // already converge, active-set sweeps to convergence before the next full
+    // sweep. Exit is always off a *full* sweep. A single-level loop reaches
+    // the same tolerance ball but a different iterate inside it, which is
+    // enough to move where the fdev truncation fires.
+    let mut passes = 0usize;
+    while passes < max_iter {
+        passes += 1;
+        if sweep(beta, &mut r, &mut ever_active, false) < thresh {
             break;
+        }
+        while passes < max_iter {
+            passes += 1;
+            if sweep(beta, &mut r, &mut ever_active, true) < thresh {
+                break;
+            }
         }
     }
 }
@@ -134,15 +185,83 @@ fn lambda_path(x: &Mat, y: &[f64], alpha: f64, nlambda: usize) -> Vec<f64> {
     (0..nlambda).map(|i| lmax * (step * i as f64).exp()).collect()
 }
 
-/// Fit the whole lambda path at one alpha, warm-starting down the path.
-fn path_fit(x: &Mat, y: &[f64], alpha: f64, lambdas: &[f64], thresh: f64) -> Vec<Vec<f64>> {
+/// `glmnet.control()` defaults that govern where the path stops.
+const FDEV: f64 = 1e-5;
+const DEVMAX: f64 = 0.999;
+const MNLAM: usize = 5;
+
+/// Fraction of null deviance explained by `beta` on already-centred data —
+/// glmnet's `rsq` / `dev.ratio`.
+fn dev_ratio(x: &Mat, y: &[f64], beta: &[f64], tss: f64) -> f64 {
+    if !(tss > 0.0) {
+        return 0.0;
+    }
+    let mut rss = 0.0;
+    for i in 0..x.nrow() {
+        let mut pred = 0.0;
+        for (j, &b) in beta.iter().enumerate() {
+            if b != 0.0 {
+                pred += b * x.get(i, j);
+            }
+        }
+        rss += (y[i] - pred) * (y[i] - pred);
+    }
+    1.0 - rss / tss
+}
+
+/// Fit the lambda path at one alpha, warm-starting down the path.
+///
+/// `truncate` reproduces the Fortran kernel's early exit, which is *not*
+/// cosmetic: glmnet stops adding lambdas once the fit stops improving
+/// (`rsq - rsq0 < fdev*rsq`) or has essentially saturated (`rsq > devmax`),
+/// having always emitted at least `mnlam` of them. A 20x17 design typically
+/// yields 50-60 lambdas, not 100 — so the small, near-interpolating end of
+/// the grid is never offered to cross-validation at all. Evaluating it
+/// anyway lets CV pick a lambda R could not have picked, which is how the
+/// port used to report R2 = 0.999 on targets where R reports 0.049.
+///
+/// The rule is suppressed (`flmin >= 1` in the Fortran) whenever the caller
+/// supplies the lambda vector, which is exactly the per-fold case inside
+/// `cv.glmnet`: every fold fits the full sequence the outer fit produced.
+fn path_fit(
+    x: &Mat,
+    y: &[f64],
+    alpha: f64,
+    lambdas: &[f64],
+    thresh: f64,
+    truncate: bool,
+) -> Vec<Vec<f64>> {
     let p = x.ncol();
     let xx: Vec<f64> = (0..p).map(|j| dot(x.col(j), x.col(j))).collect();
+    let tss: f64 = y.iter().map(|v| v * v).sum();
+    // glmnet's internal y-standardisation: `y` is already centred here, so
+    // this is the population standard deviation it divides through by.
+    let ys = (tss / x.nrow() as f64).sqrt();
+    let thresh = thresh * ys * ys;
     let mut beta = vec![0.0; p];
     let mut out = Vec::with_capacity(lambdas.len());
-    for &l in lambdas {
-        descend(x, y, alpha, l, &mut beta, &xx, thresh, 1000);
+    let mut rsq0 = 0.0f64;
+    let mnl = MNLAM.min(lambdas.len());
+    for (m, &l) in lambdas.iter().enumerate() {
+        // glmnet substitutes an effectively infinite first lambda when it
+        // generates the path itself, so the leading solution is exactly zero
+        // even for ridge. With a supplied path it uses the value as given.
+        if truncate && m == 0 {
+            out.push(beta.clone());
+            continue;
+        }
+        descend(x, y, alpha, l, ys, &mut beta, &xx, thresh, 100_000);
         out.push(beta.clone());
+        if !truncate {
+            continue;
+        }
+        let rsq = dev_ratio(x, y, &beta, tss);
+        if m + 1 >= mnl {
+            if rsq - rsq0 < FDEV * rsq || rsq > DEVMAX {
+                break;
+            }
+        }
+        rsq0 = rsq;
     }
     out
 }
@@ -205,7 +324,13 @@ pub fn cv_fit(x: &Mat, y: &[f64], alphas: &[f64], thresh: f64) -> Option<EnFit> 
     let mut best: Option<(f64, EnFit)> = None; // (cvup, fit)
 
     for &alpha in alphas {
-        let lambdas = lambda_path(&xc, &yc, alpha, 100);
+        // `cv.glmnet` fits the full data once to obtain the lambda sequence,
+        // then hands that exact sequence to every fold. The outer fit is the
+        // only one allowed to stop early, so it also fixes how many rungs
+        // cross-validation ever sees.
+        let grid = lambda_path(&xc, &yc, alpha, 100);
+        let full = path_fit(&xc, &yc, alpha, &grid, thresh, true);
+        let lambdas = &grid[..full.len()];
         // Per-fold squared errors for every lambda.
         let mut sq: Vec<Vec<f64>> = vec![Vec::new(); lambdas.len()];
         for held in &fold_sets {
@@ -217,7 +342,7 @@ pub fn cv_fit(x: &Mat, y: &[f64], alphas: &[f64], thresh: f64) -> Option<EnFit> 
             let yt: Vec<f64> = keep.iter().map(|&i| yc[i]).collect();
             // Re-centre within the fold, as glmnet does.
             let (xt, yt, tm, tym) = center(&xt, &yt);
-            let betas = path_fit(&xt, &yt, alpha, &lambdas, thresh);
+            let betas = path_fit(&xt, &yt, alpha, lambdas, thresh, false);
             for (li, b) in betas.iter().enumerate() {
                 for &i in held {
                     let mut pred = tym;
@@ -253,23 +378,9 @@ pub fn cv_fit(x: &Mat, y: &[f64], alphas: &[f64], thresh: f64) -> Option<EnFit> 
             continue;
         }
 
-        let full = path_fit(&xc, &yc, alpha, &lambdas, thresh);
         let beta = full[best_li].clone();
-
-        // dev.ratio = 1 - RSS/null deviance.
-        let mut rss = 0.0;
-        let mut tss = 0.0;
-        for i in 0..n {
-            let mut pred = 0.0;
-            for j in 0..p {
-                if beta[j] != 0.0 {
-                    pred += beta[j] * xc.get(i, j);
-                }
-            }
-            rss += (yc[i] - pred) * (yc[i] - pred);
-            tss += yc[i] * yc[i];
-        }
-        let dev_ratio = if tss > 0.0 { 1.0 - rss / tss } else { 0.0 };
+        let tss: f64 = yc.iter().map(|v| v * v).sum();
+        let dev_ratio = dev_ratio(&xc, &yc, &beta, tss);
 
         let intercept = ymean - (0..p).map(|j| beta[j] * xmeans[j]).sum::<f64>();
         let fit = EnFit {
@@ -285,6 +396,116 @@ pub fn cv_fit(x: &Mat, y: &[f64], alphas: &[f64], thresh: f64) -> Option<EnFit> 
     }
 
     best.map(|(_, f)| f)
+}
+
+/// The full-data path at one alpha, as `glmnet()` itself would report it:
+/// `(lambda, dev.ratio, df)` per rung, already truncated. Lets the truncation
+/// rule be measured without cross-validation in the way.
+pub fn path_probe(x: &Mat, y: &[f64], alpha: f64, thresh: f64) -> Vec<(f64, f64, usize)> {
+    let (xc, yc, _, _) = center(x, y);
+    let grid = lambda_path(&xc, &yc, alpha, 100);
+    let betas = path_fit(&xc, &yc, alpha, &grid, thresh, true);
+    let tss: f64 = yc.iter().map(|v| v * v).sum();
+    betas
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            (
+                grid[i],
+                dev_ratio(&xc, &yc, b, tss),
+                b.iter().filter(|v| **v != 0.0).count(),
+            )
+        })
+        .collect()
+}
+
+/// One alpha's cross-validation summary, in the same columns
+/// `equivalence/en_probe.R` prints from real `cv.glmnet`.
+#[derive(Debug)]
+pub struct AlphaDiag {
+    pub alpha: f64,
+    pub nlam: usize,
+    pub lmax: f64,
+    pub lmin_path: f64,
+    pub lambda_min: f64,
+    pub cvm: f64,
+    pub cvup: f64,
+    pub nonzero: usize,
+}
+
+/// Per-alpha diagnostics for the equivalence probe. Deliberately a thin
+/// re-run of `cv_fit`'s loop rather than a refactor of it: the probe must not
+/// be able to drift away from the code it is measuring, and the alternative —
+/// threading an optional collector through `cv_fit` — puts test scaffolding
+/// on the hot path that every target pays for.
+pub fn cv_probe(x: &Mat, y: &[f64], alphas: &[f64], thresh: f64) -> Vec<AlphaDiag> {
+    let n = x.nrow();
+    let p = x.ncol();
+    let mut out = Vec::new();
+    if n < 3 || p == 0 {
+        return out;
+    }
+    let (xc, yc, _, _) = center(x, y);
+    let fold_sets = folds(n, n_folds(n));
+
+    for &alpha in alphas {
+        let grid = lambda_path(&xc, &yc, alpha, 100);
+        let full = path_fit(&xc, &yc, alpha, &grid, thresh, true);
+        let lambdas = &grid[..full.len()];
+        let mut sq: Vec<Vec<f64>> = vec![Vec::new(); lambdas.len()];
+        for held in &fold_sets {
+            let keep: Vec<usize> = (0..n).filter(|i| !held.contains(i)).collect();
+            if keep.len() < 2 {
+                continue;
+            }
+            let xt = xc.select_rows(&keep);
+            let yt: Vec<f64> = keep.iter().map(|&i| yc[i]).collect();
+            let (xt, yt, tm, tym) = center(&xt, &yt);
+            for (li, b) in path_fit(&xt, &yt, alpha, lambdas, thresh, false)
+                .iter()
+                .enumerate()
+            {
+                for &i in held {
+                    let mut pred = tym;
+                    for j in 0..p {
+                        if b[j] != 0.0 {
+                            pred += b[j] * (xc.get(i, j) - tm[j]);
+                        }
+                    }
+                    let e = yc[i] - pred;
+                    sq[li].push(e * e);
+                }
+            }
+        }
+        let (mut li, mut cvm, mut cvup) = (0usize, f64::INFINITY, f64::INFINITY);
+        for (i, errs) in sq.iter().enumerate() {
+            if errs.is_empty() {
+                continue;
+            }
+            let m = errs.iter().sum::<f64>() / errs.len() as f64;
+            if m < cvm {
+                let var = errs.iter().map(|e| (e - m) * (e - m)).sum::<f64>()
+                    / (errs.len().max(2) as f64 - 1.0);
+                cvm = m;
+                cvup = m + (var / errs.len() as f64).sqrt();
+                li = i;
+            }
+        }
+        if !cvm.is_finite() {
+            continue;
+        }
+        out.push(AlphaDiag {
+            alpha,
+            nlam: lambdas.len(),
+            lmax: lambdas[0],
+            lmin_path: lambdas[lambdas.len() - 1],
+            lambda_min: lambdas[li],
+            cvm,
+            cvup,
+            nonzero: full[li].iter().filter(|b| **b != 0.0).count(),
+        });
+    }
+    out
 }
 
 /// The alpha grid `ElasticNet` uses when `alfaEN` is NULL — which is always,
@@ -335,7 +556,7 @@ mod tests {
         let (xc, yc, _, _) = center(&x, &y);
         let xx: Vec<f64> = (0..xc.ncol()).map(|j| dot(xc.col(j), xc.col(j))).collect();
         let mut beta = vec![0.0; xc.ncol()];
-        descend(&xc, &yc, 1.0, 1e6, &mut beta, &xx, 1e-7, 100);
+        descend(&xc, &yc, 1.0, 1e6, 1.0, &mut beta, &xx, 1e-7, 100);
         assert!(beta.iter().all(|b| *b == 0.0));
     }
 
@@ -346,7 +567,7 @@ mod tests {
         let path = lambda_path(&xc, &yc, 1.0, 100);
         let xx: Vec<f64> = (0..xc.ncol()).map(|j| dot(xc.col(j), xc.col(j))).collect();
         let mut beta = vec![0.0; xc.ncol()];
-        descend(&xc, &yc, 1.0, path[0], &mut beta, &xx, 1e-7, 100);
+        descend(&xc, &yc, 1.0, path[0], 1.0, &mut beta, &xx, 1e-7, 100);
         assert!(beta.iter().all(|b| b.abs() < 1e-12), "{beta:?}");
     }
 

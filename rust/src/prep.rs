@@ -121,11 +121,28 @@ pub fn format_r_number(v: f64) -> String {
     }
 }
 
-/// `model.matrix(~0 + Group)` column names, in R's factor-level order
-/// (alphabetical), prefixed `Group_`.
-pub fn design_columns(groups: &[String]) -> Vec<String> {
+/// `model.matrix` column names, in R's factor-level order (alphabetical),
+/// prefixed `Group_`.
+///
+/// The two methods build this differently and the difference is not cosmetic:
+///
+/// * PLS1 (`MORE_PLS.R:337`) uses `model.matrix(~0 + ., ...)` — no intercept,
+///   so **every** level gets a column;
+/// * MLR (`MORE_MLR.R:318`) uses `model.matrix(~Group)[, -1, drop = FALSE]` —
+///   an intercept model with the first (alphabetically first) level dropped as
+///   the reference.
+///
+/// Giving MLR all the levels hands the elastic net a design that is rank
+/// deficient by construction, doubles the interaction terms, and splits every
+/// condition effect across two collinear columns. On a two-condition run that
+/// is 26 design columns where R has 17.
+pub fn design_columns(groups: &[String], drop_reference: bool) -> Vec<String> {
     let levels: std::collections::BTreeSet<&String> = groups.iter().collect();
-    levels.into_iter().map(|g| format!("Group_{g}")).collect()
+    let mut cols: Vec<String> = levels.into_iter().map(|g| format!("Group_{g}")).collect();
+    if drop_reference && !cols.is_empty() {
+        cols.remove(0);
+    }
+    cols
 }
 
 /// Condition column names **for the rpc table**, which are NOT the design
@@ -358,7 +375,7 @@ mod tests {
     #[test]
     fn design_columns_are_sorted_like_r_factor_levels() {
         let g = vec!["1_0".to_string(), "0_1".to_string(), "1_0".to_string()];
-        assert_eq!(design_columns(&g), vec!["Group_0_1", "Group_1_0"]);
+        assert_eq!(design_columns(&g, false), vec!["Group_0_1", "Group_1_0"]);
     }
 
     #[test]
@@ -367,13 +384,13 @@ mod tests {
         // the opposite of the sorted factor levels the design matrix uses.
         let g = vec!["1_0".to_string(), "1_0".to_string(), "0_1".to_string()];
         assert_eq!(rpc_columns(&g), vec!["Group_1_0", "Group_0_1"]);
-        assert_eq!(design_columns(&g), vec!["Group_0_1", "Group_1_0"]);
+        assert_eq!(design_columns(&g, false), vec!["Group_0_1", "Group_1_0"]);
     }
 
     #[test]
     fn the_design_matrix_is_one_hot_per_sample() {
         let g = vec!["1_0".to_string(), "0_1".to_string()];
-        let cols = design_columns(&g);
+        let cols = design_columns(&g, false);
         let d = design_matrix(&g, &cols);
         assert_eq!(d[0], vec![0.0, 1.0]);
         assert_eq!(d[1], vec![1.0, 0.0]);

@@ -27,7 +27,84 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::ExitCode;
 
+/// Equivalence instrument, not part of the CLI contract: given the path to a
+/// design matrix dumped by `equivalence/en_probe.R` (response in column 1),
+/// print the same per-alpha columns that script prints from `cv.glmnet`, then
+/// exit. Kept off the option parser so `--help` still mirrors `runMORE.R`
+/// exactly.
+fn en_probe(path: &str) -> ExitCode {
+    // Header row of variable names, then one row per sample; response first.
+    // `write.table(..., row.names = FALSE)` shape, parsed here rather than
+    // through `Frame` because `Frame` is feature-by-sample with row labels.
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("MORE ERROR: cannot read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut lines = text.lines();
+    let ncol = match lines.next() {
+        Some(h) => h.split('\t').count(),
+        None => {
+            eprintln!("MORE ERROR: {path} is empty");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut y = Vec::new();
+    let mut cols: Vec<Vec<f64>> = vec![Vec::new(); ncol - 1];
+    for line in lines.filter(|l| !l.trim().is_empty()) {
+        let vals: Vec<f64> = line.split('\t').map(|v| v.trim().parse().unwrap_or(f64::NAN)).collect();
+        if vals.len() != ncol {
+            eprintln!("MORE ERROR: ragged row in {path}");
+            return ExitCode::FAILURE;
+        }
+        y.push(vals[0]);
+        for (j, c) in cols.iter_mut().enumerate() {
+            c.push(vals[j + 1]);
+        }
+    }
+    let x = matrix::Mat::from_columns(&cols);
+    println!("   probe {} x {}", x.nrow(), x.ncol());
+    if let Ok(a) = std::env::var("MORE_RS_EN_PATH") {
+        let alpha: f64 = a.parse().unwrap_or(1.0);
+        let t: f64 = std::env::var("MORE_RS_EN_THRESH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1e-5);
+        for (i, (lam, dev, df)) in elasticnet::path_probe(&x, &y, alpha, t).iter().enumerate() {
+            println!("   {:3} lambda={:.6e} dev={:.6} df={}", i + 1, lam, dev, df);
+        }
+        return ExitCode::SUCCESS;
+    }
+    let mut best: Option<&elasticnet::AlphaDiag> = None;
+    // MORE passes `thres = epsilon` = 1e-5; the override exists so the
+    // convergence tolerance can be held fixed while the path-truncation rule
+    // is measured on its own.
+    let thresh: f64 = std::env::var("MORE_RS_EN_THRESH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1e-5);
+    let diags = elasticnet::cv_probe(&x, &y, &elasticnet::default_alphas(), thresh);
+    for d in &diags {
+        println!(
+            "   a={:.1} nlam={:3} lmax={:.6} lmin_path={:.6} lambda.min={:.6} cvm={:.6} cvup={:.6} nz={}",
+            d.alpha, d.nlam, d.lmax, d.lmin_path, d.lambda_min, d.cvm, d.cvup, d.nonzero
+        );
+        if best.map_or(true, |b| d.cvup < b.cvup) {
+            best = Some(d);
+        }
+    }
+    if let Some(b) = best {
+        println!("   WINNER a={:.1} cvup={:.6}", b.alpha, b.cvup);
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
+    if let Some(p) = std::env::var_os("MORE_RS_EN_PROBE") {
+        return en_probe(&p.to_string_lossy());
+    }
     let opts = match Options::parse_args() {
         Ok(o) => o,
         Err(e) => {
@@ -149,7 +226,8 @@ fn run(opts: &Options) -> Result<(), String> {
     let kept_samples = target.col_names.clone();
     let condition = condition.select_rows(&kept_samples);
     let groups = prep::group_labels(&condition);
-    let design_cols = prep::design_columns(&groups);
+    // MLR drops the reference level; PLS1 keeps every level. See prep::design_columns.
+    let design_cols = prep::design_columns(&groups, opts.method == Method::Mlr);
     let design_values = prep::design_matrix(&groups, &design_cols);
     // The rpc table's condition columns are ordered differently from the design
     // matrix's — see prep::rpc_columns.

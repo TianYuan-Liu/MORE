@@ -140,6 +140,7 @@ fn fit_one(
             for g in &groups {
                 eprintln!("DBG   group {} members={:?}", g.name, g.members);
             }
+            eprintln!("DBG   columns {:?}", design.columns);
         }
         return fit_one_mlr(target, y_raw, design, &groups);
     }
@@ -338,7 +339,7 @@ mod tests {
         )];
         let groups: Vec<String> =
             (0..n).map(|i| if i < 6 { "A".to_string() } else { "B".to_string() }).collect();
-        let cols = crate::prep::design_columns(&groups);
+        let cols = crate::prep::design_columns(&groups, false);
         let values = crate::prep::design_matrix(&groups, &cols);
         (target, omics, cols, values)
     }
