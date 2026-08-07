@@ -160,16 +160,71 @@ pub fn find_groups(
                 }
             }
         }
-        if edges != members.len() * (members.len() - 1) / 2 {
+        if edges == members.len() * (members.len() - 1) / 2 {
+            // Complete clique: collapse whole.
+            collapsed += 1;
+            let rep = members[0];
+            groups.push(Group {
+                name: format!("{}_mc{}_R", model[rep].omic, collapsed),
+                representative: model[rep].regulator.clone(),
+                members: members.iter().map(|&i| model[i].regulator.clone()).collect(),
+            });
             continue;
         }
-        collapsed += 1;
-        let rep = members[0];
-        groups.push(Group {
-            name: format!("{}_mc{}_R", model[rep].omic, collapsed),
-            representative: model[rep].regulator.clone(),
-            members: members.iter().map(|&i| model[i].regulator.clone()).collect(),
-        });
+
+        // Not a clique. R does NOT discard it -- it peels stars until every
+        // node is isolated: take the highest-degree node, absorb all of its
+        // neighbours into one group, remove them, repeat. This is the branch
+        // that turns a single 20-node component with 21 edges into six groups,
+        // and its naming `<omic>_mc<i>_<j>_R` is what the R output shows.
+        let mut alive: Vec<bool> = vec![false; n];
+        for &m in &members {
+            alive[m] = true;
+        }
+        let mut j = 0usize;
+        loop {
+            let degree = |v: usize, alive: &[bool]| -> usize {
+                (0..n).filter(|&w| alive[w] && adj[v][w]).count()
+            };
+            let mut best: Option<usize> = None;
+            let mut best_deg = 0usize;
+            let mut best_sum = f64::NEG_INFINITY;
+            for &v in &members {
+                if !alive[v] {
+                    continue;
+                }
+                let d = degree(v, &alive);
+                if d == 0 {
+                    continue;
+                }
+                // Tie-break on the summed absolute correlation of the node's
+                // edges, as R does; R breaks a further tie with sample(), this
+                // takes the first in canonical order.
+                let sum: f64 =
+                    (0..n).filter(|&w| alive[w] && adj[v][w]).map(|w| corr[v][w].abs()).sum();
+                if d > best_deg || (d == best_deg && sum > best_sum) {
+                    best = Some(v);
+                    best_deg = d;
+                    best_sum = sum;
+                }
+            }
+            let Some(rep) = best else { break };
+
+            let neighbours: Vec<usize> =
+                (0..n).filter(|&w| alive[w] && adj[rep][w]).collect();
+            j += 1;
+            let mut group_members = vec![model[rep].regulator.clone()];
+            for &w in &neighbours {
+                group_members.push(model[w].regulator.clone());
+                alive[w] = false;
+            }
+            alive[rep] = false;
+            groups.push(Group {
+                name: format!("{}_mc{}_{}_R", model[rep].omic, c + 1, j),
+                representative: model[rep].regulator.clone(),
+                members: group_members,
+            });
+        }
     }
 
     (groups, skipped_binary)

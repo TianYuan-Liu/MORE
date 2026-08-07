@@ -486,7 +486,51 @@ little else. That structure produces precisely small disjoint cliques of size
 The filter runs *before* interactions are built, so it does receive the raw
 regulator matrix. The port's ordering was right all along.
 
-### 4.10 An unresolved contradiction — stop and reproduce it first
+### 4.11 RESOLVED: non-complete components are star-peeled, not discarded
+
+Tracing `CollinearityFilter1` inside a live run showed it receives exactly the
+raw 20 x 20 regulator matrix (`FILTER-IN dim: 20 20`, columns `R1..R20`), which
+is the matrix whose igraph analysis reports zero complete components. The
+contradiction in §4.10 was therefore *inside the filter*, in a branch that had
+not been read.
+
+`CollinearityFilter1` handles a non-complete component in an `else` branch that
+**iteratively peels stars** rather than discarding it:
+
+```
+while not every node is isolated:
+    repre  = highest-degree node
+             ties broken by max sum |r| over its edges, then by sample()
+    absorb every neighbour of repre into one group
+    name it <omic>_mc<i>_<j>_R
+    remove them; j = j + 1
+```
+
+That is the source of the `TF_mc1_1_R … TF_mc1_6_R` naming — component `i = 1`,
+peels `j = 1..6` — and it turns a single 20-node component with 21 edges into
+six groups. The port previously rejected such components outright, which is why
+it found zero.
+
+Implemented in `collinearity.rs`. The port now produces six groups with R's
+names and the same group-size multiset on the probe job, and the harness moved:
+
+| set | before | after |
+| --- | --- | --- |
+| mlr-small | 0.4632 | **0.6304** |
+| mlr-denser | 0.3434 | **0.5931** |
+
+against R's own 0.854 seed band. Still failing, so MLR remains unshippable, but
+the mechanism was real and is now in place.
+
+The residual is whole targets differing — R models a target the port does not
+and vice versa — which is the expected signature of the `sample()` tie-breaks
+inside the peel loop changing group composition, and therefore which regulators
+enter the model at all. That is the fourth RNG site on this path and the first
+one that can move the edge set, so it is the next thing to characterise: count
+how often the degree/correlation tie-break is actually hit before assuming it
+explains the gap.
+
+### 4.10 An unresolved contradiction — RESOLVED, see §4.11
 
 Two measurements now conflict, and both were taken directly:
 
