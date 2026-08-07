@@ -548,10 +548,36 @@ alpha loop, the clique representative, and this tie-break). The brief's
 criterion for stochastic paths — precision/recall inside R's own seed-to-seed
 spread — remains the reachable one, and R's spread here is Jaccard 0.854.
 
-Current state: 0.6304 and 0.5931 against that 0.854. The port is closer to R
-than to where it started (0.2247), and the remaining distance is dominated by a
-mechanism that is random on R's side. Whether to close it by reproducing R's RNG
-is a cost decision for the maintainer, not a defect to keep chasing.
+#### 4.11.2 Correction: the band must be measured PER CONFIGURATION
+
+The 0.854 figure came from one dataset (12 x 12 x 20) and was then used to score
+every MLR set. That is wrong — the brief says the spread is to be *measured*,
+and it varies enormously with the data. `equivalence/mlr_seed_band.R` runs
+`more(method="MLR")` at three seeds on a given configuration and reports the
+pairwise Jaccards:
+
+| configuration | R vs R (seeds 123/456/789) | port vs R | verdict |
+| --- | --- | --- | --- |
+| `mlr-small` 12 x 12 x 20, 1 driver | 0.6413 / 0.8415 / 0.5652 — **min 0.5652** | **0.6304** | **inside R's own spread** |
+| `mlr-denser` 12 x 20 x 20, 2 drivers | 1.0000 / 1.0000 / 1.0000 | 0.5931 | **fails — R is deterministic here** |
+
+Two consequences, and they point in opposite directions.
+
+`mlr-small` **passes** the brief's stochastic criterion: R disagrees with itself
+by more (0.5652) than the port disagrees with R (0.6304). Scoring it against a
+band borrowed from other data was the only reason it looked like a failure.
+
+`mlr-denser` **genuinely fails**, and more damningly than before: R is perfectly
+reproducible across all three seeds there, so none of the four RNG sites is
+active on that configuration, and the 0.5931 is a real defect with a
+deterministic cause still to be found. The tie-break rate of §4.11.1 cannot
+explain it.
+
+So the remaining MLR work is narrower and better-posed than "reproduce R's RNG":
+find what makes the port diverge on a configuration where R is deterministic.
+Start by diffing per-target selected variables on `mlr-denser` specifically —
+`MORE_RS_DEBUG_MLR=1` against `equivalence/mlr_internals_probe.R` — since
+whatever is wrong there is a plain bug, not randomness.
 
 ### 4.10 An unresolved contradiction — RESOLVED, see §4.11
 
