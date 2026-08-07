@@ -308,6 +308,53 @@ here. Until it exists the port cannot reproduce the MLR edge set no matter how
 good the elastic net is, because the reported set is a function of the grouping,
 not only of the selection.
 
+### 4.5 `CollinearityFilter1` — the algorithm to implement
+
+`GetMLR` passes `col.filter = "cor"`, so `CollinearityFilter1` is the one on the
+PaintOmics path (`ResultsPerTargetF.i.mlr:76`); `CollinearityFilter2` (`"pcor"`,
+partial correlations) is unreachable from `runMORE.R`. It runs only when the
+target has more than one Model regulator.
+
+1. scale the regulator matrix (`scale(data, scale, center)`);
+2. for every pair of `filter == "Model"` regulators compute a correlation whose
+   *kind* depends on the two omic types (`correlations`):
+   - numeric/numeric → Pearson `cor`
+   - numeric/binary → `ltm::biserial.cor`
+   - binary/binary → `psych::phi` on the contingency table
+3. keep pairs with `|r| >= correlation` (0.7 from `more()`'s default);
+4. build an undirected graph on those pairs and take its connected components;
+5. **collapse a component only if it is a complete clique** —
+   `nedges == csize*(csize-1)/2`. A merely connected, non-clique component is
+   left alone;
+6. pick one member as the representative, drop the other columns, and rename the
+   survivor `<omic>_mc<i>_R`. Append a duplicate row to the regulator table under
+   that name, set the representative's own `filter` to it, and set each dropped
+   member's `filter` to `<omic>_mc<i>_P` or `_N` according to the sign of its
+   correlation with the representative.
+
+Then, after elastic-net selection, `ResultsPerTargetF.i.mlr:170-179` expands any
+selected `*_mc<i>_R` variable back to **every** regulator whose `filter` names
+that group, and removes the representative itself. That expansion is the whole
+recall gap in §4.4.
+
+#### 4.5.1 A third RNG site
+
+Step 6 uses `keep = sample(correlacionados, 1)` — the representative is drawn at
+**random**, from the same stream `set.seed(123)` seeds. This is a third RNG
+dependence on the MLR path, after `cv.glmnet`'s folds and its alpha loop.
+
+It is the most benign of the three for edge-set purposes: the *membership* of a
+group is deterministic (a clique in the correlation graph), and the expansion in
+`relevantRegulators` returns every member regardless of which one was drawn. So
+the reported edge set should be stable under this draw even though the retained
+column, its name, and therefore the coefficient attribution are not.
+
+A port may therefore choose the representative deterministically — first member
+in canonical order — and still expect edge-set agreement, while the per-condition
+coefficients for a collapsed group will differ because they are attached to a
+different member. That difference has a mechanism, and it is this one; it should
+be reported as such rather than absorbed into a tolerance.
+
 ## 5. Output contract (`runMORE.R:501-602`)
 
 Byte-exact. `<seed>` is `--date_seed`, `<name>` is the sanitised omic name
