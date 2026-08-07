@@ -189,6 +189,9 @@ pub fn find_groups(
             let mut best: Option<usize> = None;
             let mut best_deg = 0usize;
             let mut best_sum = f64::NEG_INFINITY;
+            // How many nodes tie on BOTH degree and summed |r| — the point at
+            // which R falls back to sample() and this port cannot follow.
+            let mut tied = 0usize;
             for &v in &members {
                 if !alive[v] {
                     continue;
@@ -206,9 +209,15 @@ pub fn find_groups(
                     best = Some(v);
                     best_deg = d;
                     best_sum = sum;
+                    tied = 1;
+                } else if d == best_deg && (sum - best_sum).abs() < 1e-12 {
+                    tied += 1;
                 }
             }
             let Some(rep) = best else { break };
+            if tied > 1 && std::env::var_os("MORE_RS_DEBUG_MLR").is_some() {
+                eprintln!("DBG   TIE degree={best_deg} among {tied} nodes -- R would sample()");
+            }
 
             let neighbours: Vec<usize> =
                 (0..n).filter(|&w| alive[w] && adj[rep][w]).collect();

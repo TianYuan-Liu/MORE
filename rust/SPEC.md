@@ -526,9 +526,32 @@ The residual is whole targets differing — R models a target the port does not
 and vice versa — which is the expected signature of the `sample()` tie-breaks
 inside the peel loop changing group composition, and therefore which regulators
 enter the model at all. That is the fourth RNG site on this path and the first
-one that can move the edge set, so it is the next thing to characterise: count
-how often the degree/correlation tie-break is actually hit before assuming it
-explains the gap.
+one that can move the edge set.
+
+#### 4.11.1 The tie-break rate, measured
+
+Counted over the probe job (12 targets, 20 regulators, 20 samples):
+
+```
+72 star peels total
+12 of them tie on BOTH degree and summed |r|   -> 17%
+```
+
+So roughly **one peel decision in six is a coin flip that R resolves with
+`sample()`**. Each one changes which regulators land in a group, hence which
+enter the model at all, hence the edge set. This is measured, not inferred.
+
+That closes the question of whether MLR edge-set *equality* is reachable: it is
+not, without reproducing R's Mersenne-Twister stream and the exact order it is
+consumed across targets — now four separate call sites (`cv.glmnet` folds, the
+alpha loop, the clique representative, and this tie-break). The brief's
+criterion for stochastic paths — precision/recall inside R's own seed-to-seed
+spread — remains the reachable one, and R's spread here is Jaccard 0.854.
+
+Current state: 0.6304 and 0.5931 against that 0.854. The port is closer to R
+than to where it started (0.2247), and the remaining distance is dominated by a
+mechanism that is random on R's side. Whether to close it by reproducing R's RNG
+is a cost decision for the maintainer, not a defect to keep chasing.
 
 ### 4.10 An unresolved contradiction — RESOLVED, see §4.11
 
