@@ -779,12 +779,16 @@ tie-break and the representative choice are each a single function.
 
 Still open and independent of the RNG:
 
-* **`representative` column is not populated.** R's MLR rpc table names the
-  representative regulator (`R8`, `R14`) and gives every clique member the
+* ~~**`representative` column is not populated.**~~ **Fixed.** R's MLR rpc
+  table names the representative regulator and gives every clique member the
   representative's coefficient, sign-flipped for `_N` members
-  (`output_analysis.R:300-335`). The port leaves the column blank and gives
-  each member its own coefficient, which is 0 for non-selected members. This
-  is an output-contract gap, not a modelling one.
+  (`output_analysis.R:300-335`); the port left the column blank and gave each
+  member its own coefficient, which is 0 for a non-selected member. `Group`
+  now carries a per-member sign taken from the correlation with the
+  representative, and `rpc_rows_for` attributes accordingly. This does not
+  move the edge set — edges come from the already-expanded significant set —
+  but it is what the table is supposed to say, and it improves mlr-small's
+  worst coefficient from 9.754e-01 to 8.104e-01.
 * **Clique membership differs** for one group (R's `{R5,R7,R14}` vs the port's
   `{R7,R14}` with R5 elsewhere) — the component-splitting tie of §4.11.1,
   also `sample()`-driven.

@@ -30,6 +30,12 @@ pub struct TargetResult {
     pub rmsee: Option<f64>,
     pub ncomp: Option<usize>,
     pub problem: Option<&'static str>,
+    /// Collinearity groups collapsed for this target. Empty on the PLS1 path,
+    /// which does not collapse. The rpc table needs them after the fit: every
+    /// member inherits the representative's coefficient, sign-flipped when the
+    /// member correlates negatively with it, and names it in the
+    /// `representative` column.
+    pub groups: Vec<crate::collinearity::Group>,
 }
 
 impl TargetResult {
@@ -44,6 +50,7 @@ impl TargetResult {
             rmsee: None,
             ncomp: None,
             problem: Some(problem),
+            groups: Vec::new(),
         }
     }
 }
@@ -230,6 +237,8 @@ fn fit_one(
         rmsee: Some(reported.rmsee),
         ncomp: Some(reported.n_comp),
         problem,
+        // PLS1 does not collapse collinear regulators.
+        groups: Vec::new(),
     }
 }
 
@@ -302,6 +311,7 @@ fn fit_one_mlr(
         rmsee: None,
         ncomp: None,
         problem,
+        groups: groups.to_vec(),
     }
 }
 

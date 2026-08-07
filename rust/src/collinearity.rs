@@ -34,6 +34,11 @@ pub struct Group {
     pub representative: String,
     /// Every regulator in the clique, representative included.
     pub members: Vec<String>,
+    /// +1 or -1 per member, parallel to `members`: the sign of that member's
+    /// correlation with the representative. R records it as the `_P`/`_N`
+    /// suffix on the filter marker and uses it to flip the representative's
+    /// coefficient when attributing it to the member (`output_analysis.R:330`).
+    pub signs: Vec<f64>,
 }
 
 /// Pearson correlation. Under `scaleType = "auto"` R correlates the scaled
@@ -175,6 +180,10 @@ pub fn find_groups(
                 name: format!("{}_mc{}_R", model[rep].omic, collapsed),
                 representative: model[rep].regulator.clone(),
                 members: members.iter().map(|&i| model[i].regulator.clone()).collect(),
+                signs: members
+                    .iter()
+                    .map(|&i| if i == rep || corr[rep][i] >= 0.0 { 1.0 } else { -1.0 })
+                    .collect(),
             });
             continue;
         }
@@ -230,8 +239,10 @@ pub fn find_groups(
                 (0..n).filter(|&w| alive[w] && adj[rep][w]).collect();
             j += 1;
             let mut group_members = vec![model[rep].regulator.clone()];
+            let mut group_signs = vec![1.0f64];
             for &w in &neighbours {
                 group_members.push(model[w].regulator.clone());
+                group_signs.push(if corr[rep][w] >= 0.0 { 1.0 } else { -1.0 });
                 alive[w] = false;
             }
             alive[rep] = false;
@@ -239,6 +250,7 @@ pub fn find_groups(
                 name: format!("{}_mc{}_{}_R", model[rep].omic, c + 1, j),
                 representative: model[rep].regulator.clone(),
                 members: group_members,
+                signs: group_signs,
             });
         }
     }
@@ -385,11 +397,30 @@ mod tests {
     }
 
     #[test]
+    fn a_negatively_correlated_member_is_recorded_with_a_negative_sign() {
+        // Two regulators that are perfectly anti-correlated: |r| clears the
+        // 0.7 threshold, so they collapse, but the member carries -1 so the
+        // rpc table can flip the representative's coefficient for it.
+        let a: Vec<f64> = (0..8).map(|i| i as f64).collect();
+        let b: Vec<f64> = a.iter().map(|v| -v).collect();
+        let rows = vec![row("A", "TF"), row("B", "TF")];
+        let o = omic("TF", &[("A", a), ("B", b)], false);
+        let (groups, _) = find_groups(&rows, &[o], 0.7);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        let g = &groups[0];
+        let member = g.members.iter().position(|m| m != &g.representative).unwrap();
+        assert_eq!(g.signs[member], -1.0);
+        let rep = g.members.iter().position(|m| m == &g.representative).unwrap();
+        assert_eq!(g.signs[rep], 1.0);
+    }
+
+    #[test]
     fn suppressed_lists_every_member_but_the_representative() {
         let g = Group {
             name: "TF_mc1_R".into(),
             representative: "A".into(),
             members: vec!["A".into(), "B".into(), "C".into()],
+            signs: vec![1.0, 1.0, 1.0],
         };
         let mut s = suppressed(&[g]);
         s.sort();
@@ -402,6 +433,7 @@ mod tests {
             name: "TF_mc1_R".into(),
             representative: "A".into(),
             members: vec!["A".into(), "B".into(), "C".into()],
+            signs: vec![1.0, 1.0, 1.0],
         };
         let out = expand(&["A".to_string()], &[g]);
         assert_eq!(out, vec!["A", "B", "C"]);
@@ -413,6 +445,7 @@ mod tests {
             name: "TF_mc1_R".into(),
             representative: "A".into(),
             members: vec!["A".into(), "B".into()],
+            signs: vec![1.0, 1.0],
         };
         assert_eq!(expand(&["Z".to_string()], &[g]), vec!["Z"]);
     }

@@ -33,6 +33,9 @@ pub struct RpcRow {
     /// One coefficient per `Group_*` column, in `design_cols` order.
     pub betas: Vec<f64>,
     pub r2: Option<f64>,
+    /// Real regulator ID of the collinearity-group representative this row
+    /// stands with; empty for a regulator that is in no group.
+    pub representative: String,
 }
 
 /// Build the rpc table for one target.
@@ -92,6 +95,7 @@ fn rpc_rows_for(result: &TargetResult, design_cols: &[String], target_sd: f64) -
             area: meta.area.clone(),
             betas: vec![0.0; n_groups],
             r2: result.r2,
+            representative: String::new(),
         });
     }
 
@@ -137,6 +141,29 @@ fn rpc_rows_for(result: &TargetResult, design_cols: &[String], target_sd: f64) -
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // A collapsed clique has exactly one column in the design -- the
+    // representative's -- so only its row picked up a coefficient above. R
+    // hands that coefficient to every member, negated for members that
+    // correlate negatively with the representative (the `_N` marker), and
+    // records the representative's real ID alongside
+    // (`output_analysis.R:300-335`). Without this pass every non-representative
+    // member reports a beta of zero while still counting as a reported edge.
+    for group in &result.groups {
+        let Some(&rep_row) = where_is.get(group.representative.as_str()) else {
+            continue;
+        };
+        let rep_betas = rows[rep_row].betas.clone();
+        for (member, sign) in group.members.iter().zip(&group.signs) {
+            let Some(&mi) = where_is.get(member.as_str()) else {
+                continue;
+            };
+            rows[mi].representative = group.representative.clone();
+            if mi != rep_row {
+                rows[mi].betas = rep_betas.iter().map(|b| b * sign).collect();
             }
         }
     }
@@ -270,9 +297,9 @@ pub fn write_rpc(
             row.area.clone(),
         ];
         if representative {
-            // Empty for a regulator that is not standing in for a collinearity
-            // group, which is what R writes for filter == "Model".
-            fields.push(String::new());
+            // R names the representative's real regulator ID here and leaves
+            // it blank for a regulator in no group (filter == "Model").
+            fields.push(row.representative.clone());
         }
         fields.extend(row.betas.iter().map(|b| format_r_double(*b)));
         // na = "" in write.table.
@@ -381,6 +408,7 @@ mod tests {
             regulators: vec![reg("R1", "TF"), reg("R2", "TF")],
             significant: significant.into_iter().map(|s| s.to_string()).collect(),
             coefficients: coeffs.into_iter().map(|(v, b)| (v.to_string(), b, 0.01)).collect(),
+            groups: Vec::new(),
             r2: Some(0.9),
             q2: Some(0.8),
             rmsee: Some(0.1),
@@ -421,6 +449,62 @@ mod tests {
         let r = result_with(vec![("R1", 2.0)], vec!["R1"]);
         let rows = rpc_rows_for(&r, &groups(), 4.0);
         assert_eq!(rows[0].betas, vec![0.5, 0.5]);
+    }
+
+    /// A clique whose representative is R1 and whose other member correlates
+    /// with the sign given.
+    fn clique(sign: f64) -> Vec<crate::collinearity::Group> {
+        vec![crate::collinearity::Group {
+            name: "TF_mc1_R".into(),
+            representative: "R1".into(),
+            members: vec!["R1".into(), "R2".into()],
+            signs: vec![1.0, sign],
+        }]
+    }
+
+    #[test]
+    fn a_clique_member_inherits_the_representatives_beta() {
+        // Only R1 has a design column; R2 rides along through the group.
+        let mut r = result_with(vec![("R1", 2.0)], vec!["R1", "R2"]);
+        r.groups = clique(1.0);
+        let rows = rpc_rows_for(&r, &groups(), 1.0);
+        let r2 = rows.iter().find(|x| x.regulator == "R2").expect("R2 row");
+        assert_eq!(r2.betas, vec![2.0, 2.0]);
+    }
+
+    #[test]
+    fn a_negatively_correlated_member_inherits_the_opposite_sign() {
+        let mut r = result_with(vec![("R1", 2.0)], vec!["R1", "R2"]);
+        r.groups = clique(-1.0);
+        let rows = rpc_rows_for(&r, &groups(), 1.0);
+        let r2 = rows.iter().find(|x| x.regulator == "R2").expect("R2 row");
+        assert_eq!(r2.betas, vec![-2.0, -2.0]);
+    }
+
+    #[test]
+    fn every_clique_member_names_the_representative() {
+        let mut r = result_with(vec![("R1", 2.0)], vec!["R1", "R2"]);
+        r.groups = clique(1.0);
+        let rows = rpc_rows_for(&r, &groups(), 1.0);
+        for row in &rows {
+            assert_eq!(row.representative, "R1", "{}", row.regulator);
+        }
+    }
+
+    #[test]
+    fn a_regulator_in_no_clique_leaves_the_representative_column_empty() {
+        let r = result_with(vec![("R1", 2.0)], vec!["R1"]);
+        let rows = rpc_rows_for(&r, &groups(), 1.0);
+        assert_eq!(rows[0].representative, "");
+    }
+
+    #[test]
+    fn the_representative_keeps_its_own_beta_unscaled_by_its_sign() {
+        let mut r = result_with(vec![("R1", 2.0)], vec!["R1", "R2"]);
+        r.groups = clique(-1.0);
+        let rows = rpc_rows_for(&r, &groups(), 1.0);
+        let r1 = rows.iter().find(|x| x.regulator == "R1").expect("R1 row");
+        assert_eq!(r1.betas, vec![2.0, 2.0]);
     }
 
     #[test]
@@ -467,6 +551,7 @@ mod tests {
             regulator: "R1".into(),
             omic: "TF".into(),
             area: String::new(),
+            representative: String::new(),
             betas: vec![1.0, 2.0],
             r2: Some(0.9),
         }];
