@@ -575,9 +575,48 @@ explain it.
 
 So the remaining MLR work is narrower and better-posed than "reproduce R's RNG":
 find what makes the port diverge on a configuration where R is deterministic.
-Start by diffing per-target selected variables on `mlr-denser` specifically —
-`MORE_RS_DEBUG_MLR=1` against `equivalence/mlr_internals_probe.R` — since
-whatever is wrong there is a plain bug, not randomness.
+
+#### 4.11.3 Localised: cross-validated (alpha, lambda) selection
+
+Done, by comparing the `R2` column of `MORE_rpc_*.tab` per target between the
+two implementations on the `mlr-denser` configuration.
+
+**Both sides model all twelve targets** — the target sets are identical, so
+model *admission* and the `filterR2` gate are not the cause, and the earlier
+reading of "whole targets differ" was about edges, not targets.
+
+What differs is the fitted model itself:
+
+| target | R2 (R) | R2 (port) |
+| --- | --- | --- |
+| G7 | 0.049 | **0.999** |
+| G5 | 0.712 | **0.267** |
+| G3 | 0.473 | 0.223 |
+| G1 | 0.191 | 0.266 |
+| G6 | 0.832 | 0.999 |
+
+The port lands on a near-unpenalised fit where R lands on a heavily penalised
+one (G7), and the reverse elsewhere (G5). Since `dev.ratio` is a direct function
+of the retained `(alpha, lambda)`, the divergence is in **cross-validated
+hyper-parameter selection** — not in the collinearity grouping, not in the
+expansion, not in model admission.
+
+Concretely, the suspects in `elasticnet.rs::cv_fit`, in order of likelihood:
+
+1. the lambda path — `lambda_max` uses `alpha.max(1e-3)` as glmnet does for
+   ridge, but the `lambda_min_ratio` switch (`0.01` when `n < p`, else `1e-4`)
+   and the 100-point geometric spacing must match glmnet's or `lambda.min`
+   lands on a different rung;
+2. `cvm` is averaged over pooled per-observation squared errors; glmnet with
+   `grouped = FALSE` does the same, but the fold re-centring here re-centres
+   both X and y inside each fold, which glmnet may not;
+3. the alpha choice uses `cvm + cvsd` (`cvup`) at each alpha's own
+   `lambda.min` — verify `cvsd` is the standard error glmnet reports, not the
+   standard deviation.
+
+Compare against `equivalence/mlr_alpha_probe.R`, which already prints
+`lambda.min` and `cvup` per alpha from real `cv.glmnet` — the port should be
+made to print the same three columns and diffed row by row.
 
 ### 4.10 An unresolved contradiction — RESOLVED, see §4.11
 
