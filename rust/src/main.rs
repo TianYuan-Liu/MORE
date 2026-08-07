@@ -6,6 +6,7 @@
 //! and stays the oracle for the equivalence harness.
 
 mod cli;
+mod collinearity;
 mod data;
 mod design;
 mod elasticnet;
@@ -220,6 +221,7 @@ fn run(opts: &Options) -> Result<(), String> {
             vip: opts.vip,
             interactions: opts.interactions,
             method: opts.method,
+            correlation: 0.7,
         };
     let results = model::fit_all(&targets, &target, &omics, &design_cols, &design_values, &params);
 

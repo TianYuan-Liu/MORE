@@ -53,6 +53,8 @@ pub struct FitParams {
     pub vip: f64,
     pub interactions: bool,
     pub method: crate::cli::Method,
+    /// MORE's `correlation` default; the collinearity threshold on the MLR path.
+    pub correlation: f64,
 }
 
 /// Fit every target. The only shared mutable state is none — each target
@@ -93,8 +95,23 @@ fn fit_one(
     design::classify(&mut regulators, omics);
 
     let n = y_raw.len();
+
+    // MLR collapses cliques of correlated regulators BEFORE the design is
+    // built, then expands the survivor back to its whole group after
+    // selection. Without this the elastic net reports one edge where R
+    // reports the entire clique -- the whole MLR recall gap.
+    let mut groups = Vec::new();
+    let mut design_rows = regulators.clone();
+    if params.method == crate::cli::Method::Mlr {
+        let (g, _skipped_binary) =
+            crate::collinearity::find_groups(&regulators, omics, params.correlation);
+        let drop = crate::collinearity::suppressed(&g);
+        design_rows.retain(|r| !drop.contains(&r.regulator));
+        groups = g;
+    }
+
     let built = design::build(
-        &regulators,
+        &design_rows,
         omics,
         design_cols,
         design_values,
@@ -109,7 +126,7 @@ fn fit_one(
     // MLR models the response on its own scale and fits an intercept; PLS1
     // is handed a scaled response (ResultsPerTargetF.i:107).
     if params.method == crate::cli::Method::Mlr {
-        return fit_one_mlr(target, y_raw, design);
+        return fit_one_mlr(target, y_raw, design, &groups);
     }
 
     let mut y = y_raw.to_vec();
@@ -185,7 +202,12 @@ fn fit_one(
 /// test, so `alpha`/`vip` play no part here. The chosen (alpha, lambda) pair
 /// comes from cross-validation; see `elasticnet` for why the folds are
 /// deterministic and what that costs, measured.
-fn fit_one_mlr(target: &str, y_raw: &[f64], design: Design) -> TargetResult {
+fn fit_one_mlr(
+    target: &str,
+    y_raw: &[f64],
+    design: Design,
+    groups: &[crate::collinearity::Group],
+) -> TargetResult {
     let fit = match crate::elasticnet::cv_fit(
         &design.x,
         y_raw,
@@ -206,14 +228,16 @@ fn fit_one_mlr(target: &str, y_raw: &[f64], design: Design) -> TargetResult {
         .map(|(name, b)| (name.clone(), *b, f64::NAN))
         .collect();
 
-    let mut significant: Vec<String> = Vec::new();
+    let mut selected: Vec<String> = Vec::new();
     for (name, _, _) in &coefficients {
         for reg in design::regulators_of(name, &design.regulators) {
-            if !significant.contains(&reg) {
-                significant.push(reg);
+            if !selected.contains(&reg) {
+                selected.push(reg);
             }
         }
     }
+    // A selected representative stands for every member of its clique.
+    let significant = crate::collinearity::expand(&selected, groups);
 
     let problem = if significant.is_empty() {
         Some("No significant regulators after variable selection")
@@ -307,7 +331,7 @@ mod tests {
     #[test]
     fn the_driving_regulator_is_selected() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
         let res = fit_all(&["G1".to_string()], &target, &omics, &cols, &values, &params);
         assert_eq!(res.len(), 1);
         assert!(res[0].significant.contains(&"DRV".to_string()), "{:?}", res[0].significant);
@@ -316,7 +340,7 @@ mod tests {
     #[test]
     fn every_regulator_is_reported_even_when_not_significant() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
         let res = fit_all(&["G1".to_string()], &target, &omics, &cols, &values, &params);
         assert_eq!(res[0].regulators.len(), 2);
         assert!(res[0].regulators.iter().all(|r| r.filter == Filter::Model));
@@ -325,7 +349,7 @@ mod tests {
     #[test]
     fn a_target_absent_from_the_expression_matrix_is_reported_not_dropped() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
         let res = fit_all(&["MISSING".to_string()], &target, &omics, &cols, &values, &params);
         assert_eq!(res.len(), 1);
         assert!(res[0].problem.is_some());
@@ -334,7 +358,7 @@ mod tests {
     #[test]
     fn goodness_of_fit_is_reported_when_a_model_exists() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
         let res = fit_all(&["G1".to_string()], &target, &omics, &cols, &values, &params);
         assert!(res[0].r2.is_some());
         assert!(res[0].ncomp.unwrap() >= 1);
@@ -343,7 +367,7 @@ mod tests {
     #[test]
     fn coefficients_are_returned_only_for_significant_variables() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
         let res = fit_all(&["G1".to_string()], &target, &omics, &cols, &values, &params);
         assert!(!res[0].coefficients.is_empty());
         for (_, _, p) in &res[0].coefficients {
@@ -355,7 +379,7 @@ mod tests {
     fn fanning_out_gives_the_same_answer_as_one_target_at_a_time() {
         // The parallel path must not depend on how targets are batched.
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
         let many = fit_all(
             &["G1".to_string(), "G1".to_string(), "G1".to_string()],
             &target, &omics, &cols, &values, &params,
