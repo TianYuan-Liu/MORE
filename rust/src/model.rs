@@ -110,8 +110,10 @@ fn fit_one(
     let mut groups = Vec::new();
     let mut design_rows = regulators.clone();
     if params.method == crate::cli::Method::Mlr {
-        let (g, _skipped_binary) =
-            crate::collinearity::find_groups(&regulators, omics, params.correlation);
+        let (g, _skipped_binary) = match crate::collinearity::groups_from_override(target) {
+            Some(g) => (g, 0usize),
+            None => crate::collinearity::find_groups(&regulators, omics, params.correlation),
+        };
         let drop = crate::collinearity::suppressed(&g);
         design_rows.retain(|r| !drop.contains(&r.regulator));
         groups = g;

@@ -30,6 +30,20 @@ counter$i <- 0L
 assign(".more_design_counter", counter, envir = globalenv())
 assign(".more_design_out", outdir, envir = globalenv())
 
+## The collinearity filter's own answer: SummaryPerTargetF's `filter` column
+## carries `<omic>_mc<i>_R` on the representative and `_P`/`_N` on the other
+## members, so one dump per target fixes both membership and the sign.
+trace(MORE:::CollinearityFilter1, exit = quote({
+  cnt <- get(".more_design_counter", envir = globalenv())
+  rv <- returnValue()
+  if (!is.null(rv)) {
+    write.table(rv$SummaryPerTargetF,
+                file.path(get(".more_design_out", envir = globalenv()),
+                          sprintf("cf_%03d.tsv", cnt$i + 1L)),
+                sep = "\t", quote = FALSE, row.names = FALSE)
+  }
+}), print = FALSE)
+
 trace(MORE:::ElasticNet, tracer = quote({
   cnt <- get(".more_design_counter", envir = globalenv())
   cnt$i <- cnt$i + 1L

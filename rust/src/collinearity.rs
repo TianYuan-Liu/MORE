@@ -72,6 +72,66 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
 /// case is implemented. Pairs involving an omic that `isBin` flagged binary are
 /// **not grouped at all**, which is conservative — it can only under-collapse,
 /// never invent a group — and is surfaced by the caller rather than hidden.
+/// Replay a collinearity grouping captured from R instead of computing one.
+///
+/// `MORE_RS_GROUPS_OVERRIDE=<dir>` points at the `cf_*.tsv` dumps that
+/// `equivalence/design_probe.R` takes from `CollinearityFilter1`'s return
+/// value: `targetF, regulator, omic, area, filter`, where `filter` is
+/// `<omic>_mc<i>_R` on the representative and `_P`/`_N` on the other members.
+///
+/// This exists to *test a diagnosis*, not to ship: R draws both the clique
+/// representative and the star-peel tie-break from its RNG, so the only way to
+/// tell whether those draws explain a residual edge-set difference is to hand
+/// the port R's answer and re-measure. It is never consulted unless the
+/// variable is set.
+pub fn groups_from_override(target: &str) -> Option<Vec<Group>> {
+    let dir = std::env::var_os("MORE_RS_GROUPS_OVERRIDE")?;
+    let mut by_group: std::collections::BTreeMap<String, (Option<String>, Vec<(String, f64)>)> =
+        std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let text = match std::fs::read_to_string(entry.path()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        for line in text.lines().skip(1) {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 5 || f[0] != target {
+                continue;
+            }
+            let (regulator, filter) = (f[1], f[4]);
+            // The synthetic representative rows carry filter "Model"; so do
+            // genuinely ungrouped regulators. Neither belongs to a group.
+            let Some(stem) = filter.strip_suffix("_R").map(|s| (s, 0.0f64))
+                .or_else(|| filter.strip_suffix("_P").map(|s| (s, 1.0)))
+                .or_else(|| filter.strip_suffix("_N").map(|s| (s, -1.0)))
+            else {
+                continue;
+            };
+            let e = by_group.entry(stem.0.to_string()).or_default();
+            if filter.ends_with("_R") {
+                e.0 = Some(regulator.to_string());
+            } else {
+                e.1.push((regulator.to_string(), stem.1));
+            }
+        }
+    }
+    if by_group.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (name, (rep, others)) in by_group {
+        let Some(rep) = rep else { continue };
+        let mut members = vec![rep.clone()];
+        let mut signs = vec![1.0];
+        for (m, sg) in others {
+            members.push(m);
+            signs.push(sg);
+        }
+        out.push(Group { name: format!("{name}_R"), representative: rep, members, signs });
+    }
+    Some(out)
+}
+
 pub fn find_groups(
     rows: &[RegulatorRow],
     omics: &[Omic],
@@ -151,6 +211,9 @@ pub fn find_groups(
 
     let mut groups = Vec::new();
     let mut collapsed = 0usize;
+    // Star-peel representatives in the order they were chosen. Membership is
+    // *not* decided here -- see the relabelling pass below.
+    let mut peel_order: Vec<(usize, usize, usize)> = Vec::new();
     for c in 0..n_components {
         let members: Vec<usize> = (0..n).filter(|&i| component[i] == c).collect();
         if members.len() < 2 {
@@ -220,7 +283,20 @@ pub fn find_groups(
                 // edges, as R does; R breaks a further tie with sample(), this
                 // takes the first in canonical order.
                 let sum: f64 =
-                    (0..n).filter(|&w| alive[w] && adj[v][w]).map(|w| corr[v][w].abs()).sum();
+                    // R's tie-break sums |r| over the ORIGINAL `mycor` table:
+                    //   sums = sapply(maxcorrelationed, function(x)
+                    //            sum(abs(mycor[which(apply(mycor[,c(1,2)]==c(x),1,any)),3])))
+                    // `mycor` is built once, before any peeling, so a candidate
+                    // still earns credit for edges to regulators that have
+                    // already been swept away. Restricting this to `alive`
+                    // neighbours -- the intuitive reading -- makes genuine ties
+                    // out of decided cases: on the mlr-denser path the last
+                    // component leaves {R7, R14}, both degree 1, alive-sums both
+                    // 0.7137, whereas R gives R14 1.4237 through its dead edge
+                    // to R5 and picks it outright. That single column is worth
+                    // 31 of the 34 edges the port used to differ by, and it is
+                    // also why R's grouping does not move with the seed.
+                    (0..n).filter(|&w| adj[v][w]).map(|w| corr[v][w].abs()).sum();
                 if d > best_deg || (d == best_deg && sum > best_sum) {
                     best = Some(v);
                     best_deg = d;
@@ -235,22 +311,70 @@ pub fn find_groups(
                 eprintln!("DBG   TIE degree={best_deg} among {tied} nodes -- R would sample()");
             }
 
+            // The design loses this representative's *currently alive*
+            // neighbours -- that is what determines the surviving columns.
             let neighbours: Vec<usize> =
                 (0..n).filter(|&w| alive[w] && adj[rep][w]).collect();
             j += 1;
-            let mut group_members = vec![model[rep].regulator.clone()];
-            let mut group_signs = vec![1.0f64];
             for &w in &neighbours {
-                group_members.push(model[w].regulator.clone());
-                group_signs.push(if corr[rep][w] >= 0.0 { 1.0 } else { -1.0 });
                 alive[w] = false;
             }
             alive[rep] = false;
+            peel_order.push((rep, c, j));
+        }
+    }
+
+    // Star-peel membership, as R's `reg.table[, "filter"]` ends up recording it.
+    //
+    // R marks the representative `_R` at the start of its own iteration, then
+    // walks `actual.correlation` -- every row of the ORIGINAL `mycor` table
+    // involving that representative -- and stamps the other endpoint `_P`/`_N`.
+    // Nothing is guarded against being written twice, so a regulator adjacent
+    // to several representatives keeps the label of the **last** one, even
+    // though the design column was removed by whichever representative swept it
+    // first. The two are genuinely different questions: which column survives
+    // (the peel) versus which group a regulator is reported under (the labels).
+    //
+    // Deciding membership at sweep time instead costs real edges: on
+    // mlr-denser, R5 is swept at j=4 with R12 but is also adjacent to R14 at
+    // j=6, so R reports it under R14's group and the port reported it under
+    // R12's.
+    if !peel_order.is_empty() {
+        // label[i] = (group index into peel_order, sign)
+        let mut label: Vec<Option<(usize, f64)>> = vec![None; n];
+        for (gi, &(rep, _, _)) in peel_order.iter().enumerate() {
+            label[rep] = Some((gi, 1.0));
+            for w in 0..n {
+                if w != rep && adj[rep][w] {
+                    label[w] = Some((gi, if corr[rep][w] >= 0.0 { 1.0 } else { -1.0 }));
+                }
+            }
+        }
+        for (gi, &(rep, c, j)) in peel_order.iter().enumerate() {
+            let mut members = Vec::new();
+            let mut signs = Vec::new();
+            // Representative first, so `members[0]` stays the representative.
+            for i in (0..n).filter(|&i| label[i].map(|l| l.0) == Some(gi)) {
+                let sign = label[i].unwrap().1;
+                if i == rep {
+                    members.insert(0, model[i].regulator.clone());
+                    signs.insert(0, 1.0);
+                } else {
+                    members.push(model[i].regulator.clone());
+                    signs.push(sign);
+                }
+            }
+            // A representative can itself be relabelled into a later group, in
+            // which case its own group has no representative left and R would
+            // carry an orphaned marker. Nothing can stand in for it, so drop it.
+            if members.first().map(|m| m != &model[rep].regulator).unwrap_or(true) {
+                continue;
+            }
             groups.push(Group {
                 name: format!("{}_mc{}_{}_R", model[rep].omic, c + 1, j),
                 representative: model[rep].regulator.clone(),
-                members: group_members,
-                signs: group_signs,
+                members,
+                signs,
             });
         }
     }
