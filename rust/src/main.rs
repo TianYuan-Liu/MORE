@@ -72,8 +72,14 @@ fn en_probe(path: &str) -> ExitCode {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1e-5);
+        let want: Option<usize> = std::env::var("MORE_RS_EN_BETA").ok().and_then(|v| v.parse().ok());
         for (i, (lam, dev, df)) in elasticnet::path_probe(&x, &y, alpha, t).iter().enumerate() {
             println!("   {:3} lambda={:.6e} dev={:.6} df={}", i + 1, lam, dev, df);
+            if want == Some(i + 1) {
+                for (j, b) in elasticnet::path_coefficients(&x, &y, alpha, t, i).iter().enumerate() {
+                    println!("   BETA {j} {b:.12e}");
+                }
+            }
         }
         return ExitCode::SUCCESS;
     }

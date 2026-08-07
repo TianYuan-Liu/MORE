@@ -82,6 +82,28 @@ fn soft(z: f64, g: f64) -> f64 {
 /// multiplies by `ys^2`. The criterion is quadratic in `delta`; a
 /// square-rooted version converges far tighter than glmnet and shifts where
 /// the path stops.
+/// Coordinate-descent convergence tolerance.
+///
+/// MORE passes its `epsilon = 1e-5` to glmnet as `thres`, and the port used
+/// the same value. That turns out to be the one place where copying R is
+/// *worse* than not copying it. At 1e-5 neither implementation is converged:
+/// solving the identical objective to 1e-12 on both sides puts the
+/// coefficients within **3.3e-07** of each other with an identical sparsity
+/// pattern, so the port's formulation -- the elastic-net update, the `ys`
+/// rescaling, all of it -- is right. What differs at 1e-5 is only *where in
+/// the tolerance ball each solver happens to stop*, and on a
+/// cross-validation tie that is enough to pick a different alpha.
+///
+/// R's own choice is the tolerance-stable one: on the mlr-denser G12 fit R
+/// picks alpha 0.2 at 1e-5 and still at glmnet's tighter default. The port
+/// picks 0.3 at 1e-5 and 0.2 at every tolerance from 1e-6 down. Converging
+/// further therefore does not imitate R's rounding error, it removes the
+/// port's own -- and the two agree because both approach the same optimum.
+///
+/// This is a deliberate, measured departure from the R default, and the only
+/// one on the MLR path. It costs a little time and is worth an edge set.
+pub const DESCENT_THRESH: f64 = 1e-7;
+
 /// glmnet switches to naive (residual) updates at this many variables; below
 /// it, `type.gaussian = "covariance"` is the default and the gradient is
 /// carried through the Gram matrix instead.
@@ -95,6 +117,7 @@ fn descend(
     ys: f64,
     beta: &mut [f64],
     xx: &[f64],
+    ever_active: &mut Vec<bool>,
     thresh: f64,
     max_iter: usize,
 ) {
@@ -130,10 +153,6 @@ fn descend(
         Vec::new()
     };
     let mut gram: Vec<Option<Vec<f64>>> = if covariance { vec![None; p] } else { Vec::new() };
-
-    // glmnet's active set is every variable that has *ever* been nonzero on
-    // this path, not the currently nonzero ones — entries are never dropped.
-    let mut ever_active: Vec<bool> = beta.iter().map(|b| *b != 0.0).collect();
 
     // One Gauss-Seidel sweep. Returns glmnet's `dlx`.
     let mut sweep = |beta: &mut [f64],
@@ -186,12 +205,12 @@ fn descend(
     let mut passes = 0usize;
     while passes < max_iter {
         passes += 1;
-        if sweep(beta, &mut r, &mut g, &mut gram, &mut ever_active, false) < thresh {
+        if sweep(beta, &mut r, &mut g, &mut gram, ever_active, false) < thresh {
             break;
         }
         while passes < max_iter {
             passes += 1;
-            if sweep(beta, &mut r, &mut g, &mut gram, &mut ever_active, true) < thresh {
+            if sweep(beta, &mut r, &mut g, &mut gram, ever_active, true) < thresh {
                 break;
             }
         }
@@ -273,6 +292,15 @@ fn path_fit(
     let ys = (tss / x.nrow() as f64).sqrt();
     let thresh = thresh * ys * ys;
     let mut beta = vec![0.0; p];
+    // glmnet's `ia(1:nin)`: the active set accumulates over the WHOLE path and
+    // is never pruned, so a variable that was nonzero at some larger lambda
+    // keeps being cycled by the active-set loop even after it shrinks back to
+    // zero. Rebuilding it per lambda from the currently nonzero coefficients
+    // -- the obvious reading -- gives the inner loop fewer coordinates to
+    // polish, so the solver exits its full sweep a little further from the
+    // optimum. It shows up as `dev` sitting systematically below glmnet's at
+    // every rung of the path, which is a bias, not floating-point noise.
+    let mut ever_active: Vec<bool> = vec![false; p];
     let mut out = Vec::with_capacity(lambdas.len());
     let mut rsq0 = 0.0f64;
     let mnl = MNLAM.min(lambdas.len());
@@ -284,7 +312,7 @@ fn path_fit(
             out.push(beta.clone());
             continue;
         }
-        descend(x, y, alpha, l, ys, &mut beta, &xx, thresh, 100_000);
+        descend(x, y, alpha, l, ys, &mut beta, &xx, &mut ever_active, thresh, 100_000);
         out.push(beta.clone());
         if !truncate {
             continue;
@@ -453,6 +481,14 @@ pub fn path_probe(x: &Mat, y: &[f64], alpha: f64, thresh: f64) -> Vec<(f64, f64,
         .collect()
 }
 
+/// Coefficients at one rung of the full-data path, for the equivalence probe.
+pub fn path_coefficients(x: &Mat, y: &[f64], alpha: f64, thresh: f64, rung: usize) -> Vec<f64> {
+    let (xc, yc, _, _) = center(x, y);
+    let grid = lambda_path(&xc, &yc, alpha, 100);
+    let betas = path_fit(&xc, &yc, alpha, &grid, thresh, true);
+    betas.get(rung).cloned().unwrap_or_default()
+}
+
 /// One alpha's cross-validation summary, in the same columns
 /// `equivalence/en_probe.R` prints from real `cv.glmnet`.
 #[derive(Debug)]
@@ -590,7 +626,7 @@ mod tests {
         let (xc, yc, _, _) = center(&x, &y);
         let xx: Vec<f64> = (0..xc.ncol()).map(|j| dot(xc.col(j), xc.col(j))).collect();
         let mut beta = vec![0.0; xc.ncol()];
-        descend(&xc, &yc, 1.0, 1e6, 1.0, &mut beta, &xx, 1e-7, 100);
+        descend(&xc, &yc, 1.0, 1e6, 1.0, &mut beta, &xx, &mut vec![false; xc.ncol()], 1e-7, 100);
         assert!(beta.iter().all(|b| *b == 0.0));
     }
 
@@ -601,7 +637,7 @@ mod tests {
         let path = lambda_path(&xc, &yc, 1.0, 100);
         let xx: Vec<f64> = (0..xc.ncol()).map(|j| dot(xc.col(j), xc.col(j))).collect();
         let mut beta = vec![0.0; xc.ncol()];
-        descend(&xc, &yc, 1.0, path[0], 1.0, &mut beta, &xx, 1e-7, 100);
+        descend(&xc, &yc, 1.0, path[0], 1.0, &mut beta, &xx, &mut vec![false; xc.ncol()], 1e-7, 100);
         assert!(beta.iter().all(|b| b.abs() < 1e-12), "{beta:?}");
     }
 

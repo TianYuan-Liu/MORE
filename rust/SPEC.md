@@ -782,59 +782,52 @@ identical to R's**, and the port's grouping matches
 | after the four elastic-net fixes | 0.8235 | 34 | 0.9231 | 1.101e+00 |
 | after the grouping fixes | **0.9842** | **3** | **1.0000** | **2.708e-02** |
 
-### Where the remaining difference lives
-### Where the remaining difference lives
+### RESOLVED: the last three edges were the port's own under-convergence
 
-After the four fixes, on **byte-identical design matrices captured from a real
-`runMORE.R` run**, the port's CV picks the same winning alpha *and* the same
-number of selected variables for **11 of 12 targets**.
+The gap closed to zero, and not by chasing floating point. The evidence, in
+the order it was gathered:
 
-Three edges, all in one collinearity group of one target: `(G12, R14)`,
-`(G12, R5)`, `(G12, R7)`. G12 is the one target whose alpha the port gets
-wrong, and the margin is vanishing:
+1. **The objective is provably identical.** Solving the same `(alpha, lambda)`
+   to `thresh = 1e-12` on both sides puts the coefficients within **3.3e-07**
+   of each other with an identical sparsity pattern (mlr-denser G12, alpha
+   0.2, lambda 0.0705205). The elastic-net update, the `ys` rescaling and the
+   penalty split are all correct.
+2. **So the difference was only where each solver stops.** At MORE's
+   `epsilon = 1e-5` *neither* implementation is converged; they land at
+   different points inside the same tolerance ball. That was visible as the
+   port's `dev` sitting ~3e-4 below glmnet's at every rung — a bias, which is
+   why it was never plausible as floating-point noise.
+3. **R's answer is the tolerance-stable one.** On G12 R picks alpha 0.2 at
+   1e-5 *and* at glmnet's tighter default. The port picked 0.3 at 1e-5 and
+   0.2 at every tolerance from 1e-6 down, with `cvup` converging on R's:
+   0.277704 at 1e-9 against R's 0.277757.
 
-| | alpha 0.2 `cvup` | alpha 0.3 `cvup` | picks |
-|---|---|---|---|
-| R, `thresh = 1e-5` (MORE's `epsilon`) | 0.275506 | 0.275866 | 0.2 by **3.6e-4** |
-| port, same tolerance | 0.275949 | 0.274293 | 0.3 by 1.7e-3 |
-| R, glmnet's tighter default | 0.277757 | 0.277761 | 0.2 by **4e-6** |
+So the port now runs coordinate descent at `DESCENT_THRESH = 1e-7` instead of
+copying MORE's `epsilon`. This is the one deliberate departure from an R
+default on the MLR path, and it is the opposite of ULP-chasing: it removes the
+port's own rounding error rather than reproducing R's. Both implementations
+approach the same optimum, and they agree there.
 
-The last row is the point: tighten glmnet's own tolerance and R's margin
-collapses to four parts per million. The data does not determine this choice;
-it is settled inside the solver's slack. MORE's `epsilon = 1e-5` is genuinely
-what reaches the kernel — verified by comparing the deprecated `thres=` form
-against `control = list(thresh = 1e-5)`, which give identical `nlam` and
-`cvup` — so the port's tolerance is correct and not the lever.
+Four candidates were tested and eliminated before this, and are recorded so
+they are not re-tried:
 
-What is left is descent arithmetic, and four structural candidates have now
-been tested and eliminated:
+| candidate | verdict |
+|---|---|
+| Covariance updates (`type.gaussian = "covariance"`, `nvars < 500`) | Implemented; **identical to six digits**. Kept as glmnet's documented algorithm, but not the cause. |
+| Active set persisting across the whole path (glmnet's `ia(1:nin)`) | Implemented; **no numerical change** — the exit criterion is the full sweep either way. Kept as faithful. |
+| Per-fold path truncation | Confirmed suppressed: an explicit 70-rung lambda vector returns all 70. |
+| Lambda unit conversion | Confirmed: supply-and-read-back round-trips to 1.4e-16, independently verifying the `ys` conversion. |
 
-1. **Covariance updates.** glmnet uses `type.gaussian = "covariance"` for
-   `nvars < 500`, carrying the gradient through the Gram matrix rather than
-   recomputing it from a maintained residual. Implemented; the numbers are
-   **identical to six digits**. Kept anyway — it is glmnet's documented
-   algorithm and avoids recomputing inner products every sweep — but it is not
-   the cause.
-2. **Convergence tolerance.** MORE's `epsilon = 1e-5` genuinely reaches the
-   kernel: glmnet 5.0's deprecated `thres=` form gives the same `nlam` and
-   `cvup` as `control = list(thresh = 1e-5)`. Sweeping the port's effective
-   threshold over 1e-5 .. 1e-7 does not reduce the per-rung `dev` gap; it
-   crosses zero somewhere near 5e-6 and grows again, so no principled value
-   reconciles the two.
-3. **Per-fold path truncation.** Confirmed suppressed: handing glmnet an
-   explicit 70-rung lambda vector returns all 70 rungs, as the port assumes.
-4. **Lambda unit conversion.** Confirmed: supplying lambda and reading it back
-   round-trips to 1.4e-16, which independently verifies the `ys` division and
-   multiplication derived above.
+Also confirmed along the way: MORE's `epsilon` really does reach the kernel —
+glmnet 5.0's deprecated `thres=` gives the same `nlam` and `cvup` as
+`control = list(thresh = 1e-5)` — so the port was not being starved of it by
+a silent deprecation.
 
-What remains is that the port's `dev` sits ~3e-4 below glmnet's at every rung
-of this path, and at the boundary rung the active sets differ by one variable
-(R `df = 11`, port `df = 12` at lambda 0.0642556). Both implementations are
-under-converged at MORE's own tolerance and land at different points inside
-the same tolerance ball. Closing that means reproducing glmnet's Fortran
-arithmetic exactly, which is the ULP-chasing the brief rules out and would
-risk flipping the eleven targets that now agree. Left undone deliberately and
-recorded here so the decision is visible rather than silent.
+**Harness: 9 of 9 parameter sets pass.** mlr-denser is edge-set-equal
+(symmetric difference 0, precision and recall 1.0000, worst coefficient
+1.220e-02). mlr-small sits at 0.6413, inside R's measured seed band of 0.5652
+— that configuration is where R's `sample()` genuinely does bite, and no
+deterministic rule reproduces a draw.
 
 ### Speed, re-measured after the MLR changes
 
@@ -842,13 +835,18 @@ recorded here so the decision is visible rather than silent.
 
 | | wall | per gene | vs 0.29 s/gene |
 |---|---|---|---|
-| PLS1 | 1.05 s | 0.00105 s | **276x** |
-| MLR (11 alphas x LOO x ~70 lambdas) | 4.99 s | 0.00499 s | 58x |
+| PLS1 | 1.07 s | 0.00107 s | **271x** |
+| MLR, `thresh = 1e-5` (edge set differs) | 4.99 s | 0.00499 s | 58x |
+| MLR, `thresh = 1e-7` (edge-set-equal) | 10.96 s | 0.01096 s | **26x** |
 
-PLS1 is untouched by this session's work; the number is up slightly from the
-1.21 s recorded earlier, not down. The at-scale parameter set stays
-edge-set-equal at 1916 edges and max |delta| = 0.000e+00, so this is not a
-speedup with different biology.
+Tightening the tolerance costs MLR 2.2x — 58x becomes 26x — and buys exact
+edge-set equality. That is the right trade under a brief whose closing line is
+that a speedup with different biology is a failure. PLS1 is untouched by any
+of this.
+
+The at-scale parameter set stays edge-set-equal at 1916 edges with
+max |delta| = 0.000e+00, so neither number is a speedup with different
+biology.
 
 ### What closing it would take, and what is still open
 

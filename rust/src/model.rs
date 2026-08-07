@@ -260,7 +260,7 @@ fn fit_one_mlr(
         &design.x,
         y_raw,
         &crate::elasticnet::default_alphas(),
-        1e-5, // MORE's `epsilon`, passed to glmnet as `thres`
+        crate::elasticnet::DESCENT_THRESH,
     ) {
         Some(f) => f,
         None => {

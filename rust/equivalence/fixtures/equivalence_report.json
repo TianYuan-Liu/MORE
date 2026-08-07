@@ -1,6 +1,6 @@
 {
   "provenance": {
-    "fork_sha": "fbe24754da162d5cf5922ccf4bb4130a37505ecc",
+    "fork_sha": "622022c43562d2579e1a7d9a767c7b33135567ba",
     "upstream_sha": "9ae6635cebaefa38daab8295a209d4856793c97a",
     "r_version": "4.6.0",
     "platform": "aarch64-apple-darwin23",
@@ -18,8 +18,8 @@
     "mlr-small",
     "mlr-denser"
   ],
-  "failures": 1,
-  "worst_abs": 0.8104,
+  "failures": 0,
+  "worst_abs": 0.8105,
   "worst_rel": 1.0,
   "r_seed_spread": 0
 }
