@@ -163,7 +163,14 @@ pub fn find_groups(
         if edges == members.len() * (members.len() - 1) / 2 {
             // Complete clique: collapse whole.
             collapsed += 1;
-            let rep = members[0];
+            // MORE_RS_REP_LAST exists only to measure how much the clique
+            // representative matters: R draws it with sample(), so a run that
+            // differs only in this choice bounds that RNG site's contribution.
+            let rep = if std::env::var_os("MORE_RS_REP_LAST").is_some() {
+                members[members.len() - 1]
+            } else {
+                members[0]
+            };
             groups.push(Group {
                 name: format!("{}_mc{}_R", model[rep].omic, collapsed),
                 representative: model[rep].regulator.clone(),

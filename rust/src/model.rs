@@ -142,6 +142,27 @@ fn fit_one(
             }
             eprintln!("DBG   columns {:?}", design.columns);
         }
+        // MORE_RS_DEBUG_DESIGN=<dir> writes this target's design matrix in the
+        // same shape equivalence/design_probe.R dumps from R, response first.
+        if let Some(dir) = std::env::var_os("MORE_RS_DEBUG_DESIGN") {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let mut out = String::new();
+            out.push_str("response");
+            for c in &design.columns {
+                out.push('\t');
+                out.push_str(c);
+            }
+            out.push('\n');
+            for i in 0..n {
+                out.push_str(&format!("{}", y_raw[i]));
+                for j in 0..design.columns.len() {
+                    out.push_str(&format!("\t{}", design.x.get(i, j)));
+                }
+                out.push('\n');
+            }
+            let _ = std::fs::write(dir.join(format!("{target}.tsv")), out);
+        }
         return fit_one_mlr(target, y_raw, design, &groups);
     }
 
@@ -236,6 +257,15 @@ fn fit_one_mlr(
         }
     };
 
+    if std::env::var_os("MORE_RS_DEBUG_MLR").is_some() {
+        eprintln!(
+            "DBG {target} chose alpha={:.1} lambda={:.6} nz={} dev={:.6}",
+            fit.alpha,
+            fit.lambda,
+            fit.coefficients.iter().filter(|b| **b != 0.0).count(),
+            fit.dev_ratio
+        );
+    }
     let coefficients: Vec<(String, f64, f64)> = design
         .columns
         .iter()

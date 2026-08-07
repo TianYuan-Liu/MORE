@@ -691,3 +691,100 @@ Input parsing must reproduce `read_matrix`: try tab and comma, keep whichever
 yields **more data columns**, reject a parse with zero data columns, zero rows,
 or any non-numeric cell. Sample alignment is a strict name-based intersection —
 positional fallback is deliberately absent and must stay absent.
+
+## §4.12 mlr-denser resolved to a single mechanism (measured 2026-08-07)
+
+§4.11.3 ranked three suspects inside `cv_fit`. Two of the three were real and
+are fixed; the third was a red herring; and the residual difference turned out
+not to be in the elastic net at all. The instruments are
+`equivalence/en_probe.R`, `en_dir_probe.R`, `en_probe_diff.py`,
+`design_probe.R`, `design_diff.py`, and the `MORE_RS_EN_PROBE` /
+`MORE_RS_EN_PATH` / `MORE_RS_DEBUG_DESIGN` / `MORE_RS_REP_LAST` env hooks.
+
+### What was actually wrong
+
+1. **The MLR design carried every condition dummy.** `MORE_MLR.R:318` builds it
+   as `model.matrix(~Group)[, -1, drop = FALSE]`; only PLS1 uses `~0 + .`
+   (`MORE_PLS.R:337`). Port had 26 columns where R has 17. Largest single
+   effect: Jaccard 0.5539 -> 0.8235.
+
+2. **Ridge penalty off by `ys`.** glmnet solves on `y/ys` and multiplies both
+   coefficients and reported lambdas by `ys` on the way out. The rescaling
+   cancels in the L1 term but not the L2:
+   `b = soft(rho, lambda_R*alpha) / (xv + lambda_R*(1-alpha)/ys)`.
+   Because L1 is unaffected, `lambda_max` matched R to every printed digit
+   throughout — the reason this hid for so long. Verified against an analytic
+   ridge solve: `l2 = lambda/ys` reproduces glmnet to 6.99e-10, `l2 = lambda`
+   to 6.10e-03.
+
+3. **The lambda path ran all 100 rungs.** glmnet's Fortran stops on
+   `fdev = 1e-5` / `devmax = 0.999` with a floor of `mnlam = 5`, so a 20x17
+   design yields 50-99 lambdas. The truncated tail is never offered to CV;
+   evaluating it let CV pick lambdas R cannot reach, producing `R2 = 0.999`
+   on targets where R reports 0.049. The rule is suppressed when the caller
+   supplies lambda (`flmin >= 1`), which is every per-fold fit.
+
+4. **Single-level coordinate descent.** glmnet alternates one full sweep with
+   active-set sweeps and only exits off a full sweep.
+
+Not a defect after all: `cvm`/`cvsd`. With `grouped = FALSE` glmnet's `cvsd`
+is `sqrt(mean((e_i - cvm)^2)/(N-1))`, algebraically identical to the port's
+`sqrt(var/n)`. Also note `n < 50` means MORE uses leave-one-out, so
+`cv.glmnet`'s `sample()` is a relabelling and the fold assignment is *not* a
+divergence at these sizes — the module note in `elasticnet.rs` predates this
+and overstates the fold issue.
+
+The probe itself was measuring the wrong code path at first: it passed
+`family = gaussian()` (the object, routing to the IRLS `glmnet.path`) where
+MORE passes `family$family`, the string, routing to the `elnet` kernel.
+
+### Where the remaining difference lives
+
+After the four fixes, on **byte-identical design matrices captured from a real
+`runMORE.R` run**, the port's CV picks the same winning alpha *and* the same
+number of selected variables for **11 of 12 targets**.
+
+`design_diff.py` shows **15 of 17 design columns numerically identical on every
+target**. The two that differ are one clique's representative and its
+interaction term: R's clique 6 is `{R5, R7, R14}` represented by `R14`, the
+port's is `{R7, R14}` represented by `R7`.
+
+`MORE_MLR.R:860` — `keep = sample(correlacionados, 1)` — draws the clique
+representative **from R's RNG**. That is the mechanism, and it is decisive:
+
+| target | R | port on its own design | port on R's design |
+|--------|---|------------------------|--------------------|
+| G1     | 0.2 | **0.0** | 0.2 |
+| G7     | 0.0 | **1.0** | 0.0 |
+| G8     | 0.4 | **0.5** | 0.4 |
+| G12    | 0.2 | 0.2     | **0.3** |
+
+Given R's own designs the port recovers G1, G7 and G8. So the residual
+mlr-denser gap is the representative draw tipping knife-edge alpha choices,
+not a cross-validation defect.
+
+`MORE_RS_REP_LAST` bounds the same site from the other direction: flipping the
+port's representative from first to last member moves mlr-small 0.6413 ->
+0.6629 and leaves mlr-denser at 0.8235 — the choice matters, but no single
+deterministic rule reproduces a draw.
+
+### What closing it would take, and what is still open
+
+Matching R here means reproducing R's Mersenne-Twister stream: `set.seed(123)`
+plus **every** consumer in order, including the 11 `cv.glmnet` `foldid` draws
+per target (which consume the stream even under LOO, where they change
+nothing) and the star-peel tie-breaks of §4.11.1. That is bounded work, not
+open-ended, and nothing in the port forecloses it — `folds`, the star-peel
+tie-break and the representative choice are each a single function.
+
+Still open and independent of the RNG:
+
+* **`representative` column is not populated.** R's MLR rpc table names the
+  representative regulator (`R8`, `R14`) and gives every clique member the
+  representative's coefficient, sign-flipped for `_N` members
+  (`output_analysis.R:300-335`). The port leaves the column blank and gives
+  each member its own coefficient, which is 0 for non-selected members. This
+  is an output-contract gap, not a modelling one.
+* **Clique membership differs** for one group (R's `{R5,R7,R14}` vs the port's
+  `{R7,R14}` with R5 elsewhere) — the component-splitting tie of §4.11.1,
+  also `sample()`-driven.
