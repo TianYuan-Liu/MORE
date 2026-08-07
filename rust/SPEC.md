@@ -211,13 +211,68 @@ this is how an interaction term `Group_Treat:TF-1` credits regulator `TF-1`.
 given the inputs, so the equivalence harness can demand tight numerics here and
 must not attribute any edge-set difference to seed variation.
 
-## 4. MLR (`method="MLR"`, `varSel="EN"`)
+## 4. MLR (`method="MLR"`, `varSel="EN"`) — NOT PORTED, and why the
+##    acceptance criterion has to change
 
-`GetMLR` → `ResultsPerTargetF.i.mlr` → `ElasticNet`. Differs from PLS1 in that it
-applies `CollinearityFilter1/2` (`correlation = 0.7`) and selects variables by
-`glmnet` elastic net with cross-validation, which **does** consume the RNG.
-Specified separately once the PLS1 path passes equivalence; PLS1 is the
-PaintOmics default and ships first.
+`GetMLR` → `ResultsPerTargetF.i.mlr` → `ElasticNet`. It differs from PLS1 in two
+ways that matter far more than the change of estimator:
+
+1. it applies `CollinearityFilter1/2` (`correlation = 0.7`), which introduces
+   collinearity *groups* with `_R`/`_P`/`_N` representative markers that
+   `RegulationPerCondition` resolves through an entirely separate code path
+   (`output_analysis.R:92-278`);
+2. **it consumes R's RNG heavily.**
+
+### 4.1 The RNG dependence is not incidental
+
+`runMORE.R` never passes `alfaEN`, so `more()`'s default `alfaEN = NULL` reaches
+`ElasticNet`, which takes the `is.null(elasticnet)` branch and runs
+**eleven `cv.glmnet` fits per target** — `alphas = seq(0, 1, 0.1)` — picking the
+alpha whose `cvup` at `lambda.min` is smallest. Every one of those calls draws
+its own cross-validation folds from R's Mersenne-Twister, seeded once by
+`set.seed(123)` in `more()` and then advanced sequentially across targets.
+
+A different fold assignment moves `lambda.min`, which moves the selected
+variable set, which moves the edge set.
+
+### 4.2 Measured, not assumed
+
+Same input, 12 targets x 12 regulators x 20 samples, via `more(method="MLR",
+varSel="EN")`:
+
+| comparison | result |
+| --- | --- |
+| seed 123 run twice | **identical** — R is deterministic *given* a seed |
+| seed 123 vs seed 456 | 72 vs 80 edges, symmetric difference **12**, Jaccard **0.854** |
+
+So roughly 15% of the edge set is seed-dependent *inside R itself*.
+
+### 4.3 Consequence for the acceptance criterion
+
+The port brief requires significant edge sets to be **set-equal or hard fail**.
+On the PLS1 path that is achievable and achieved — that path reaches no RNG at
+all, and the harness measures R's seed spread there as exactly **0 edges**.
+
+On the MLR path it is achievable **only** by reimplementing R's Mersenne-Twister
+and `sample.int` fold assignment, glmnet's lambda-path construction, its
+coordinate-descent convergence rule at `thres = 1e-5`, and the exact order in
+which the RNG stream is advanced across targets. Anything short of that produces
+a symmetric difference whose mechanism is "different CV folds" — a real,
+identifiable, non-numerical mechanism, but not one that can be tuned away.
+
+The brief's other criterion — *precision/recall within R's own seed-to-seed
+spread, measured not assumed* — is the one that can be satisfied, and §4.2 is
+the measurement it would be scored against.
+
+**This is a decision for the maintainer, not one to take silently**, because
+shipping an MLR that quietly returns a different 15% of the edges is precisely
+the "speedup with different biology" the brief calls a failure. Until it is
+taken, `--method MLR` exits with a message pointing at `runMORE.R` rather than
+doing something different under the same name.
+
+Reference sources for whichever route is chosen are dumped alongside this spec's
+notes: `GetMLR`, `ElasticNet`, `ResultsPerTargetF.i.mlr`, `CollinearityFilter1`,
+`CollinearityFilter2`, `modelcharac`.
 
 ## 5. Output contract (`runMORE.R:501-602`)
 
