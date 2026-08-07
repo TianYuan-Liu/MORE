@@ -82,6 +82,11 @@ fn soft(z: f64, g: f64) -> f64 {
 /// multiplies by `ys^2`. The criterion is quadratic in `delta`; a
 /// square-rooted version converges far tighter than glmnet and shifts where
 /// the path stops.
+/// glmnet switches to naive (residual) updates at this many variables; below
+/// it, `type.gaussian = "covariance"` is the default and the gradient is
+/// carried through the Gram matrix instead.
+const COVARIANCE_MAX_VARS: usize = 500;
+
 fn descend(
     x: &Mat,
     y: &[f64],
@@ -95,7 +100,11 @@ fn descend(
 ) {
     let n = x.nrow() as f64;
     let p = x.ncol();
-    // Residual, recomputed once then updated incrementally.
+
+    let l1 = lambda * alpha;
+    let l2 = lambda * (1.0 - alpha) / ys;
+
+    // Residual for the current (possibly warm-started) beta.
     let mut r: Vec<f64> = y.to_vec();
     for j in 0..p {
         if beta[j] != 0.0 {
@@ -105,8 +114,22 @@ fn descend(
         }
     }
 
-    let l1 = lambda * alpha;
-    let l2 = lambda * (1.0 - alpha) / ys;
+    // Covariance mode carries `g[j] = <x_j, r>` forward by subtracting
+    // `delta * <x_j, x_k>` on every update, exactly as glmnet's `elnet1` does,
+    // instead of recomputing the inner product from a maintained residual each
+    // sweep. The two are algebraically identical and numerically are not: the
+    // recomputed form is the more accurate one, but it converges to a slightly
+    // different iterate inside the same tolerance ball, and MORE runs glmnet at
+    // `epsilon = 1e-5` where that ball is wide enough to change which alpha wins
+    // a cross-validation tie. Gram columns are built lazily, so only variables
+    // that actually enter the model cost anything.
+    let covariance = p < COVARIANCE_MAX_VARS;
+    let mut g: Vec<f64> = if covariance {
+        (0..p).map(|j| dot(x.col(j), &r)).collect()
+    } else {
+        Vec::new()
+    };
+    let mut gram: Vec<Option<Vec<f64>>> = if covariance { vec![None; p] } else { Vec::new() };
 
     // glmnet's active set is every variable that has *ever* been nonzero on
     // this path, not the currently nonzero ones — entries are never dropped.
@@ -115,6 +138,8 @@ fn descend(
     // One Gauss-Seidel sweep. Returns glmnet's `dlx`.
     let mut sweep = |beta: &mut [f64],
                      r: &mut Vec<f64>,
+                     g: &mut Vec<f64>,
+                     gram: &mut Vec<Option<Vec<f64>>>,
                      ever_active: &mut Vec<bool>,
                      active_only: bool| -> f64 {
         let mut dlx = 0.0f64;
@@ -124,12 +149,26 @@ fn descend(
             }
             let old = beta[j];
             // Partial residual correlation for coordinate j.
-            let rho = dot(x.col(j), r) / n + (xx[j] / n) * old;
+            let rho = if covariance {
+                g[j] / n + (xx[j] / n) * old
+            } else {
+                dot(x.col(j), r) / n + (xx[j] / n) * old
+            };
             let new = soft(rho, l1) / (xx[j] / n + l2);
             if new != old {
                 let delta = new - old;
-                for (ri, xv) in r.iter_mut().zip(x.col(j)) {
-                    *ri -= delta * xv;
+                if covariance {
+                    if gram[j].is_none() {
+                        gram[j] = Some((0..p).map(|k| dot(x.col(k), x.col(j))).collect());
+                    }
+                    let col = gram[j].as_ref().unwrap();
+                    for k in 0..p {
+                        g[k] -= delta * col[k];
+                    }
+                } else {
+                    for (ri, xv) in r.iter_mut().zip(x.col(j)) {
+                        *ri -= delta * xv;
+                    }
                 }
                 beta[j] = new;
                 if new != 0.0 {
@@ -143,18 +182,16 @@ fn descend(
 
     // The Fortran's two-level schedule: a full sweep, and if it did not
     // already converge, active-set sweeps to convergence before the next full
-    // sweep. Exit is always off a *full* sweep. A single-level loop reaches
-    // the same tolerance ball but a different iterate inside it, which is
-    // enough to move where the fdev truncation fires.
+    // sweep. Exit is always off a *full* sweep.
     let mut passes = 0usize;
     while passes < max_iter {
         passes += 1;
-        if sweep(beta, &mut r, &mut ever_active, false) < thresh {
+        if sweep(beta, &mut r, &mut g, &mut gram, &mut ever_active, false) < thresh {
             break;
         }
         while passes < max_iter {
             passes += 1;
-            if sweep(beta, &mut r, &mut ever_active, true) < thresh {
+            if sweep(beta, &mut r, &mut g, &mut gram, &mut ever_active, true) < thresh {
                 break;
             }
         }

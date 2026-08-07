@@ -806,15 +806,49 @@ what reaches the kernel — verified by comparing the deprecated `thres=` form
 against `control = list(thresh = 1e-5)`, which give identical `nlam` and
 `cvup` — so the port's tolerance is correct and not the lever.
 
-What is left is descent arithmetic: glmnet uses **covariance updates** for
-`nvars < 500`, maintaining the gradient through the Gram matrix, where the
-port recomputes it from a maintained residual. Mathematically identical,
-numerically not; measured at alpha = 1 (where the ridge term vanishes) the
-port lands ~2.5x further from the optimum than glmnet at the same nominal
-tolerance. Reproducing glmnet's accumulation order to win a 1.3e-3 relative
-margin is the ULP-chasing the brief rules out, and it would risk flipping
-targets that currently agree. Left undone deliberately, recorded here so the
-decision is visible rather than silent.
+What is left is descent arithmetic, and four structural candidates have now
+been tested and eliminated:
+
+1. **Covariance updates.** glmnet uses `type.gaussian = "covariance"` for
+   `nvars < 500`, carrying the gradient through the Gram matrix rather than
+   recomputing it from a maintained residual. Implemented; the numbers are
+   **identical to six digits**. Kept anyway — it is glmnet's documented
+   algorithm and avoids recomputing inner products every sweep — but it is not
+   the cause.
+2. **Convergence tolerance.** MORE's `epsilon = 1e-5` genuinely reaches the
+   kernel: glmnet 5.0's deprecated `thres=` form gives the same `nlam` and
+   `cvup` as `control = list(thresh = 1e-5)`. Sweeping the port's effective
+   threshold over 1e-5 .. 1e-7 does not reduce the per-rung `dev` gap; it
+   crosses zero somewhere near 5e-6 and grows again, so no principled value
+   reconciles the two.
+3. **Per-fold path truncation.** Confirmed suppressed: handing glmnet an
+   explicit 70-rung lambda vector returns all 70 rungs, as the port assumes.
+4. **Lambda unit conversion.** Confirmed: supplying lambda and reading it back
+   round-trips to 1.4e-16, which independently verifies the `ys` division and
+   multiplication derived above.
+
+What remains is that the port's `dev` sits ~3e-4 below glmnet's at every rung
+of this path, and at the boundary rung the active sets differ by one variable
+(R `df = 11`, port `df = 12` at lambda 0.0642556). Both implementations are
+under-converged at MORE's own tolerance and land at different points inside
+the same tolerance ball. Closing that means reproducing glmnet's Fortran
+arithmetic exactly, which is the ULP-chasing the brief rules out and would
+risk flipping the eleven targets that now agree. Left undone deliberately and
+recorded here so the decision is visible rather than silent.
+
+### Speed, re-measured after the MLR changes
+
+1000 targets x 30 regulators x 20 samples, same machine as the golden corpus:
+
+| | wall | per gene | vs 0.29 s/gene |
+|---|---|---|---|
+| PLS1 | 1.05 s | 0.00105 s | **276x** |
+| MLR (11 alphas x LOO x ~70 lambdas) | 4.99 s | 0.00499 s | 58x |
+
+PLS1 is untouched by this session's work; the number is up slightly from the
+1.21 s recorded earlier, not down. The at-scale parameter set stays
+edge-set-equal at 1916 edges and max |delta| = 0.000e+00, so this is not a
+speedup with different biology.
 
 ### What closing it would take, and what is still open
 
