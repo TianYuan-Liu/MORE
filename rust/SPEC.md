@@ -451,14 +451,41 @@ That narrows the remaining work sharply, and away from `collinearity.rs`:
   blocks. Confirm the column set and orientation the port reproduces.
 * `CollinearityFilter1` correlates `scale(data, scale, center)` — Pearson is
   scale-invariant, so this cannot be the difference, and is ruled out.
-* The correlation *kind* is chosen per pair by `omicType`. If `more()`'s `isBin`
-  inferred the omic as **binary**, R uses `psych::phi` on a contingency table
-  rather than Pearson, producing a completely different graph — while this port
-  skips binary pairs entirely and reports zero groups. This is the single
-  highest-value thing to check first: dump `omicType` from the R run.
+* The correlation *kind* is chosen per pair by `omicType`. **Checked and
+  falsified**: `MORE:::isBin` returns **0** for this omic (20 distinct values in
+  both the first row and the first column), so R uses Pearson, same as the port.
 
-Do not touch `collinearity.rs` until the input matrix and `omicType` have been
-compared. The grouping logic itself is now evidence-backed as correct.
+### 4.9 What survives: the filter sees the interaction-expanded matrix
+
+Every other candidate is now eliminated by measurement:
+
+| candidate | verdict |
+| --- | --- |
+| elastic-net solver / alpha selection | ruled out — R picks alpha=1.0, 2 non-zero, same shape as the port |
+| group expansion missing | implemented; real but partial (0.2247 → 0.4632) |
+| iterative peeling of components | falsified — `MORE_MLR.R:606-611` calls the filter once, no loop |
+| correlation values / threshold / clique logic | ruled out — R's own igraph run on the raw matrix gives 0 complete components, matching the port |
+| binary omic → phi/biserial correlation | falsified — `isBin` returns 0 |
+
+One explanation remains consistent with all of it. R's groups are named
+`TF_mc1_1_R … TF_mc1_6_R`: **six** groups of size **2-4**. The raw 20-regulator
+matrix yields a single 20-node component with no complete subcomponent. But the
+interaction-expanded design has 62 columns — 20 regulators, 40
+`Group_*:regulator` interactions, 2 design columns — and a main effect `R1` is
+near-perfectly correlated with its own `Group_A:R1` and `Group_B:R1` and with
+little else. That structure produces precisely small disjoint cliques of size
+2-4, in the observed count.
+
+So `CollinearityFilter1` is very likely receiving the matrix **after**
+`RegulatorsInteractions`, not before — the opposite of the ordering this port
+assumes and of what §4.6 fact (3) inferred from the coefficient rownames.
+
+Next step, and it is a read rather than a code change: establish the actual
+order of `RegulatorsInteractions` and `CollinearityFilter1` inside
+`ResultsPerTargetF.i.mlr` (`../R/MORE_MLR.R:501+`), and confirm whether
+`res$RegulatorMatrix` at the filter call site already contains interaction
+columns. If it does, the port must collapse **after** building the design, not
+before, and group members become design columns rather than regulators.
 
 ## 5. Output contract (`runMORE.R:501-602`)
 
