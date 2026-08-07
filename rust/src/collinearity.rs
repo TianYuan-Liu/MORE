@@ -78,17 +78,27 @@ pub fn find_groups(
     }
 
     // Values per Model regulator, and whether its omic is binary.
+    // A regulator that cannot be located is skipped, NOT treated as grounds to
+    // abandon grouping altogether. Aborting on the first miss silently disabled
+    // the entire filter and was the reason this found zero cliques on data
+    // where R finds six.
+    let mut model_ok: Vec<&RegulatorRow> = Vec::with_capacity(model.len());
     let mut values: Vec<&[f64]> = Vec::with_capacity(model.len());
     let mut binary: Vec<bool> = Vec::with_capacity(model.len());
     for r in &model {
         let Some(omic) = omics.iter().find(|o| o.name == r.omic) else {
-            return (Vec::new(), 0);
+            continue;
         };
         let Some(&idx) = omic.data.row_index().get(r.regulator.as_str()) else {
-            return (Vec::new(), 0);
+            continue;
         };
+        model_ok.push(r);
         values.push(&omic.data.values[idx]);
         binary.push(omic.omic_type == 1);
+    }
+    let model = model_ok;
+    if model.len() < 2 {
+        return (Vec::new(), 0);
     }
 
     let n = model.len();
