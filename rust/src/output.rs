@@ -240,6 +240,10 @@ pub fn write_rpc(
     seed: &str,
     rows: &[RpcRow],
     design_cols: &[String],
+    // The MLR branch of RegulationPerCondition keeps the collinearity-group
+    // "representative" column; the PLS branch drops it with myresults[, -5]
+    // (output_analysis.R:410). Same table, different width by method.
+    representative: bool,
 ) -> Result<(), String> {
     let path = dir.join(format!("MORE_rpc_{seed}.tab"));
     if rows.is_empty() {
@@ -251,6 +255,9 @@ pub fn write_rpc(
         "omic".to_string(),
         "area".to_string(),
     ];
+    if representative {
+        header.push("representative".to_string());
+    }
     header.extend(design_cols.iter().cloned());
     header.push("R2".to_string());
 
@@ -262,6 +269,11 @@ pub fn write_rpc(
             row.omic.clone(),
             row.area.clone(),
         ];
+        if representative {
+            // Empty for a regulator that is not standing in for a collinearity
+            // group, which is what R writes for filter == "Model".
+            fields.push(String::new());
+        }
         fields.extend(row.betas.iter().map(|b| format_r_double(*b)));
         // na = "" in write.table.
         fields.push(row.r2.map(format_r_double).unwrap_or_default());
@@ -440,7 +452,7 @@ mod tests {
     fn the_rpc_file_is_created_even_with_no_rows() {
         let dir = std::env::temp_dir().join(format!("more_rs_rpc_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        write_rpc(&dir, "seed", &[], &groups()).unwrap();
+        write_rpc(&dir, "seed", &[], &groups(), false).unwrap();
         let p = dir.join("MORE_rpc_seed.tab");
         assert!(p.exists());
         assert_eq!(fs::read_to_string(&p).unwrap(), "");
@@ -458,7 +470,7 @@ mod tests {
             betas: vec![1.0, 2.0],
             r2: Some(0.9),
         }];
-        write_rpc(&dir, "seed", &rows, &groups()).unwrap();
+        write_rpc(&dir, "seed", &rows, &groups(), false).unwrap();
         let text = fs::read_to_string(dir.join("MORE_rpc_seed.tab")).unwrap();
         let mut lines = text.lines();
         assert_eq!(lines.next().unwrap(), "targetF\tregulator\tomic\tarea\tGroup_A\tGroup_B\tR2");

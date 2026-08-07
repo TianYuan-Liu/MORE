@@ -8,6 +8,7 @@
 mod cli;
 mod data;
 mod design;
+mod elasticnet;
 mod jackknife;
 mod matrix;
 mod model;
@@ -46,13 +47,6 @@ fn main() -> ExitCode {
 }
 
 fn run(opts: &Options) -> Result<(), String> {
-    if opts.method == Method::Mlr {
-        return Err(
-            "--method MLR is not implemented in the Rust port yet; use runMORE.R for MLR jobs"
-                .into(),
-        );
-    }
-
     println!("MORE: Starting analysis...");
     let mut target = data::read_matrix(&opts.target_file)?;
     let condition = data::read_matrix(&opts.condition_file)?;
@@ -221,7 +215,12 @@ fn run(opts: &Options) -> Result<(), String> {
 
     // --- fit ---------------------------------------------------------------
     let params =
-        model::FitParams { alpha: opts.alpha, vip: opts.vip, interactions: opts.interactions };
+        model::FitParams {
+            alpha: opts.alpha,
+            vip: opts.vip,
+            interactions: opts.interactions,
+            method: opts.method,
+        };
     let results = model::fit_all(&targets, &target, &omics, &design_cols, &design_values, &params);
 
     // --- write -------------------------------------------------------------
@@ -229,7 +228,7 @@ fn run(opts: &Options) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
     let rows = output::rpc_table(&results, &target, &rpc_cols, opts.filter_r2);
-    output::write_rpc(dir, &opts.date_seed, &rows, &rpc_cols)?;
+    output::write_rpc(dir, &opts.date_seed, &rows, &rpc_cols, opts.method == Method::Mlr)?;
     println!(
         "MORE: wrote RegulationPerCondition table ({} rows) to MORE_rpc_{}.tab",
         rows.len(),

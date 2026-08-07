@@ -109,7 +109,7 @@ def run_r(data_dir, out_dir, params):
         "--data_files", str(data_dir / "regulators.tab"),
         "--assoc_files", str(data_dir / "assoc.tab"),
         "--min_variation", params["min_variation"],
-        "--method", "PLS1",
+        "--method", params.get("method", "PLS1"),
         "--alpha", str(params["alpha"]),
         "--vip", str(params["vip"]),
         "--filter_r2", "0.0",
@@ -129,7 +129,7 @@ def run_rust(data_dir, out_dir, params):
         "--data_files", str(data_dir / "regulators.tab"),
         "--assoc_files", str(data_dir / "assoc.tab"),
         "--min_variation", params["min_variation"],
-        "--method", "PLS1",
+        "--method", params.get("method", "PLS1"),
         "--alpha", str(params["alpha"]),
         "--vip", str(params["vip"]),
         "--filter_r2", "0.0",
@@ -196,7 +196,16 @@ def read_header(out_dir, name):
 
 # --- comparison --------------------------------------------------------------
 
-def compare(r_dir, rust_dir, label, report):
+# R's own MLR seed-to-seed agreement, measured by equivalence/mlr_seed_spread.R
+# (12 targets x 12 regulators x 20 samples, seed 123 vs 456): 72 vs 80 edges,
+# symmetric difference 12, Jaccard 0.854. On the MLR path R does not agree with
+# itself edge-for-edge, so set-equality is not a criterion any implementation
+# can meet without reproducing R's RNG stream; the brief's other criterion --
+# precision/recall inside R's own spread -- is what applies. See SPEC.md 4.
+MLR_SEED_JACCARD = 0.854
+
+
+def compare(r_dir, rust_dir, label, report, method="PLS1"):
     ok = True
 
     missing = [f for f in EXPECTED_FILES if not (rust_dir / f).exists()]
@@ -214,7 +223,22 @@ def compare(r_dir, rust_dir, label, report):
     r_edges, u_edges = read_pairs(r_dir), read_pairs(rust_dir)
     only_r = sorted(r_edges - u_edges)
     only_u = sorted(u_edges - r_edges)
-    if only_r or only_u:
+    jac = len(r_edges & u_edges) / len(r_edges | u_edges) if (r_edges | u_edges) else 1.0
+    if method == "MLR":
+        # Scored against R's measured self-disagreement, not against equality.
+        if jac < MLR_SEED_JACCARD:
+            report.append(
+                f"  FAIL {label}: Jaccard {jac:.4f} is below R's own seed-to-seed "
+                f"agreement of {MLR_SEED_JACCARD:.4f}\n"
+                f"    only in R:    {only_r[:10]}\n    only in Rust: {only_u[:10]}"
+            )
+            ok = False
+        else:
+            report.append(
+                f"  edges: R={len(r_edges)} Rust={len(u_edges)} Jaccard={jac:.4f} "
+                f"(R's own seed spread: {MLR_SEED_JACCARD:.4f}) symmetric difference={len(only_r)+len(only_u)}"
+            )
+    elif only_r or only_u:
         report.append(
             f"  FAIL {label}: significant edge sets differ "
             f"(R={len(r_edges)} Rust={len(u_edges)})\n"
@@ -306,6 +330,10 @@ def main():
         # Scale check: the speedup claim is only meaningful if the port stays
         # correct at a size where R's retention cost has started to bite.
         dict(name="at-scale",       n_targets=100, n_regs=60, n_samples=20, n_drivers=2, min_variation="NA", alpha=0.05, vip=0.8),
+        # MLR + elastic net. Scored against R's measured seed spread, not
+        # set-equality -- see MLR_SEED_JACCARD.
+        dict(name="mlr-small",      n_targets=12, n_regs=12, n_samples=20, n_drivers=1, min_variation="0", alpha=0.05, vip=0.8, method="MLR"),
+        dict(name="mlr-denser",     n_targets=12, n_regs=20, n_samples=20, n_drivers=2, min_variation="0", alpha=0.05, vip=0.8, method="MLR"),
     ]
     if args.sets:
         param_sets = param_sets[: args.sets]
@@ -345,6 +373,7 @@ def main():
             tmp / name / "in", ps["n_targets"], ps["n_regs"], ps["n_samples"], ps["n_drivers"]
         )
         params = {k: ps[k] for k in ("min_variation", "alpha", "vip")}
+        params["method"] = ps.get("method", "PLS1")
 
         r_out, u_out = tmp / name / "r", tmp / name / "rust"
         r_proc = run_r(data_dir, r_out, params)
@@ -361,7 +390,7 @@ def main():
             print(report[-1], flush=True)
             continue
 
-        result = compare(r_out, u_out, name, report)
+        result = compare(r_out, u_out, name, report, ps.get("method", "PLS1"))
         if isinstance(result, tuple):
             ok, wa, wr = result
             worst_abs_overall = max(worst_abs_overall, wa)
