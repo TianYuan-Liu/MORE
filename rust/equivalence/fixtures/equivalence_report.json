@@ -1,0 +1,23 @@
+{
+  "provenance": {
+    "fork_sha": "a8e1e547b3f8046df4ec9fe1a09a259506d7c79c",
+    "upstream_sha": "9ae6635cebaefa38daab8295a209d4856793c97a",
+    "r_version": "4.6.0",
+    "platform": "aarch64-apple-darwin23",
+    "blas": "libRblas.0.dylib",
+    "ropls": "1.44.0"
+  },
+  "parameter_sets": [
+    "small-auto",
+    "denser",
+    "more-samples",
+    "user-threshold",
+    "strict-alpha",
+    "loose-vip",
+    "at-scale"
+  ],
+  "failures": 0,
+  "worst_abs": 0.0,
+  "worst_rel": 0.0,
+  "r_seed_spread": 0
+}

@@ -59,6 +59,16 @@ struct Raw {
     output_dir: String,
     #[arg(long = "date_seed", default_value = "results")]
     date_seed: String,
+    /// Drop the condition x regulator interaction terms.
+    ///
+    /// Not part of `runMORE.R`'s surface — PaintOmics never passes it, so the
+    /// drop-in contract is unaffected. It exists because MORE's `interactions`
+    /// argument defaults to TRUE and `runMORE.R` never overrides it, which
+    /// makes interactions load-bearing: `RegulationPerCondition` reads
+    /// `Group_*:regulator` terms back out to build the per-condition table, so
+    /// with this flag set `MORE_rpc_*.tab` has no per-condition coefficients.
+    #[arg(long = "no_interactions", default_value_t = false)]
+    no_interactions: bool,
 }
 
 /// Validated options. One entry per omic in `omic_names` order, positionally
@@ -79,6 +89,7 @@ pub struct Options {
     pub filter_r2: f64,
     pub output_dir: String,
     pub date_seed: String,
+    pub interactions: bool,
 }
 
 impl Options {
@@ -141,6 +152,7 @@ impl Options {
             filter_r2: raw.filter_r2,
             output_dir: raw.output_dir,
             date_seed: raw.date_seed,
+            interactions: !raw.no_interactions,
         })
     }
 }
@@ -192,6 +204,7 @@ mod tests {
             filter_r2: 0.0,
             output_dir: "out".into(),
             date_seed: "results".into(),
+            no_interactions: false,
         }
     }
 
@@ -276,5 +289,13 @@ mod tests {
         assert_eq!(o.vip, 0.8);
         assert_eq!(o.filter_r2, 0.0);
         assert_eq!(o.date_seed, "results");
+        assert!(o.interactions, "MORE's interactions default is TRUE");
+    }
+
+    #[test]
+    fn interactions_can_be_switched_off_explicitly() {
+        let mut r = raw();
+        r.no_interactions = true;
+        assert!(!Options::from_raw(r).unwrap().interactions);
     }
 }
