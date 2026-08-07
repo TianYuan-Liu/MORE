@@ -738,35 +738,83 @@ The probe itself was measuring the wrong code path at first: it passed
 `family = gaussian()` (the object, routing to the IRLS `glmnet.path`) where
 MORE passes `family$family`, the string, routing to the `elnet` kernel.
 
+### CORRECTION: it was not the RNG (2026-08-07, later the same day)
+
+The paragraphs that used to stand here concluded the residual mlr-denser gap
+was R's `sample()` draw for the clique representative, and that closing it
+needed R's Mersenne-Twister stream. **That was wrong.** The check that
+disproved it cost one script: running `more()` at seeds 123/456/789 and
+dumping `CollinearityFilter1`'s return value gives **byte-identical
+groupings**, so `sample()` never reaches a live tie on this data. Two
+deterministic rules had been misread.
+
+**(a) The star-peel tie-break sums over the original table.**
+
+```r
+sums = sapply(maxcorrelationed, function(x)
+         sum(abs(mycor[which(apply(mycor[,c(1,2)]==c(x),1,any)),3])))
+```
+
+`mycor` is built once, before any peeling, so a candidate keeps credit for
+edges to regulators already swept away. The port restricted the sum to living
+neighbours — the intuitive reading — which manufactures ties out of decided
+cases. mlr-denser's component is the path `R19-R12-R5-R14-R7`; its last peel
+leaves `{R7, R14}`, both degree 1, alive-sums both 0.7137, so the port took
+R7, while R gives R14 `0.7137 + 0.7100 = 1.4237` through its dead edge to R5
+and picks it outright.
+
+**(b) Membership is the `filter` column, not who swept whom.** R stamps the
+representative `_R`, then stamps every partner in the original `mycor`
+`_P`/`_N`, with no guard against writing twice. A regulator adjacent to
+several representatives therefore keeps the **last** one's label even though
+its design column was removed by whichever representative swept it first.
+Which column survives and which group a regulator is *reported* under are
+different questions. R5 is swept at j=4 with R12 and reported under R14 at
+j=6.
+
+With both fixed, `design_diff.py` reports **every design matrix column set
+identical to R's**, and the port's grouping matches
+`CollinearityFilter1`'s own output.
+
+| | Jaccard | sym. diff. | precision | worst coeff |
+|---|---|---|---|---|
+| before the MLR work | 0.5931 | — | — | — |
+| after the four elastic-net fixes | 0.8235 | 34 | 0.9231 | 1.101e+00 |
+| after the grouping fixes | **0.9842** | **3** | **1.0000** | **2.708e-02** |
+
+### Where the remaining difference lives
 ### Where the remaining difference lives
 
 After the four fixes, on **byte-identical design matrices captured from a real
 `runMORE.R` run**, the port's CV picks the same winning alpha *and* the same
 number of selected variables for **11 of 12 targets**.
 
-`design_diff.py` shows **15 of 17 design columns numerically identical on every
-target**. The two that differ are one clique's representative and its
-interaction term: R's clique 6 is `{R5, R7, R14}` represented by `R14`, the
-port's is `{R7, R14}` represented by `R7`.
+Three edges, all in one collinearity group of one target: `(G12, R14)`,
+`(G12, R5)`, `(G12, R7)`. G12 is the one target whose alpha the port gets
+wrong, and the margin is vanishing:
 
-`MORE_MLR.R:860` — `keep = sample(correlacionados, 1)` — draws the clique
-representative **from R's RNG**. That is the mechanism, and it is decisive:
+| | alpha 0.2 `cvup` | alpha 0.3 `cvup` | picks |
+|---|---|---|---|
+| R, `thresh = 1e-5` (MORE's `epsilon`) | 0.275506 | 0.275866 | 0.2 by **3.6e-4** |
+| port, same tolerance | 0.275949 | 0.274293 | 0.3 by 1.7e-3 |
+| R, glmnet's tighter default | 0.277757 | 0.277761 | 0.2 by **4e-6** |
 
-| target | R | port on its own design | port on R's design |
-|--------|---|------------------------|--------------------|
-| G1     | 0.2 | **0.0** | 0.2 |
-| G7     | 0.0 | **1.0** | 0.0 |
-| G8     | 0.4 | **0.5** | 0.4 |
-| G12    | 0.2 | 0.2     | **0.3** |
+The last row is the point: tighten glmnet's own tolerance and R's margin
+collapses to four parts per million. The data does not determine this choice;
+it is settled inside the solver's slack. MORE's `epsilon = 1e-5` is genuinely
+what reaches the kernel — verified by comparing the deprecated `thres=` form
+against `control = list(thresh = 1e-5)`, which give identical `nlam` and
+`cvup` — so the port's tolerance is correct and not the lever.
 
-Given R's own designs the port recovers G1, G7 and G8. So the residual
-mlr-denser gap is the representative draw tipping knife-edge alpha choices,
-not a cross-validation defect.
-
-`MORE_RS_REP_LAST` bounds the same site from the other direction: flipping the
-port's representative from first to last member moves mlr-small 0.6413 ->
-0.6629 and leaves mlr-denser at 0.8235 — the choice matters, but no single
-deterministic rule reproduces a draw.
+What is left is descent arithmetic: glmnet uses **covariance updates** for
+`nvars < 500`, maintaining the gradient through the Gram matrix, where the
+port recomputes it from a maintained residual. Mathematically identical,
+numerically not; measured at alpha = 1 (where the ridge term vanishes) the
+port lands ~2.5x further from the optimum than glmnet at the same nominal
+tolerance. Reproducing glmnet's accumulation order to win a 1.3e-3 relative
+margin is the ULP-chasing the brief rules out, and it would risk flipping
+targets that currently agree. Left undone deliberately, recorded here so the
+decision is visible rather than silent.
 
 ### What closing it would take, and what is still open
 

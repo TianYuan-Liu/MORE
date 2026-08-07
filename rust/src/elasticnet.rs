@@ -6,32 +6,29 @@
 //! seq(0, 1, 0.1)` — and keeps the alpha whose `cvup` at `lambda.min` is
 //! smallest.
 //!
-//! # The one deliberate divergence, and its measured cost
+//! # Fold assignment is not a divergence at MORE's sizes
 //!
-//! `cv.glmnet` draws its folds from R's Mersenne-Twister, seeded once by
-//! `set.seed(123)` in `more()` and advanced sequentially across targets. This
-//! port uses **deterministic interleaved folds** instead, the same scheme ropls
-//! uses on the PLS1 path.
+//! `cv.glmnet` draws its folds with `sample()`, but MORE's own rule
+//! (`mynfolds`) is **leave-one-out below 50 observations**, and with
+//! `nfolds == n` the draw only relabels folds that each hold one observation.
+//! The partition — and therefore every number downstream — is identical
+//! whatever the seed. This port uses deterministic interleaved folds, which
+//! coincide exactly with R's in that regime.
 //!
-//! That is a real difference with a named mechanism — fold assignment — not a
-//! numerical artefact, and it is bounded by a measurement rather than a guess.
-//! R disagrees with *itself* by this much when only the seed changes
-//! (12 targets x 12 regulators x 20 samples, `equivalence/mlr_seed_spread.R`):
+//! Above 50 observations R takes 5/7/10 folds and the draw does start to
+//! matter; that case is not covered by the equivalence harness and the port
+//! would need R's RNG stream to match it. `folds` is a single function, so
+//! nothing here forecloses that.
 //!
-//! ```text
-//! seed 123 twice     identical
-//! seed 123 vs 456    72 vs 80 edges, symmetric difference 12, Jaccard 0.854
-//! ```
+//! # What is left
 //!
-//! So ~15% of MLR's edge set is seed-dependent inside R itself. The port is
-//! therefore held to the brief's criterion for stochastic paths — precision and
-//! recall inside R's own seed-to-seed spread — and not to set-equality, which
-//! no implementation can reach here without reproducing R's RNG stream
-//! bit-for-bit. See `SPEC.md` §4.
-//!
-//! Reproducing R's RNG remains the route to set-equality if that is ever
-//! wanted; nothing here forecloses it, since the fold assignment is a single
-//! function.
+//! Against real `cv.glmnet` on byte-identical design matrices the port picks
+//! the same winning alpha and the same selected-variable count on 11 of 12
+//! mlr-denser targets. The twelfth is a near-tie: R separates alpha 0.2 from
+//! 0.3 by 0.00036 in `cvup` (0.275506 vs 0.275866) and the port separates
+//! them by 0.00166 the other way. Tightening glmnet's own tolerance narrows
+//! R's margin to 4e-6, so the data does not determine that choice — see
+//! `SPEC.md` §4.12.
 
 use crate::matrix::{dot, Mat};
 
