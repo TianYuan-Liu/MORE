@@ -196,16 +196,34 @@ def read_header(out_dir, name):
 
 # --- comparison --------------------------------------------------------------
 
-# R's own MLR seed-to-seed agreement, measured by equivalence/mlr_seed_spread.R
-# (12 targets x 12 regulators x 20 samples, seed 123 vs 456): 72 vs 80 edges,
-# symmetric difference 12, Jaccard 0.854. On the MLR path R does not agree with
-# itself edge-for-edge, so set-equality is not a criterion any implementation
-# can meet without reproducing R's RNG stream; the brief's other criterion --
-# precision/recall inside R's own spread -- is what applies. See SPEC.md 4.
-MLR_SEED_JACCARD = 0.854
+def mlr_seed_band(ps):
+    """R's own seed-to-seed agreement ON THIS CONFIGURATION.
+
+    Measured, never assumed. An earlier version of this harness applied a single
+    0.854 constant, taken from one 12x12x20 dataset, to every set -- and the
+    spread turns out to vary enormously with the data: R is fully deterministic
+    (1.0000) on some configurations and disagrees with itself down to 0.5652 on
+    others. Scoring against a borrowed constant both hid a real failure and
+    manufactured a false one.
+
+    Returns the MINIMUM pairwise Jaccard across three seeds, i.e. the widest R
+    disagrees with itself. A port at least that close to R is inside R's own
+    spread, which is the brief's criterion for a stochastic path.
+    """
+    out = subprocess.run(
+        ["Rscript", str(HERE / "mlr_seed_band.R"),
+         str(ps["n_targets"]), str(ps["n_regs"]), str(ps["n_samples"]), str(ps["n_drivers"])],
+        capture_output=True, text=True, timeout=3600)
+    for line in out.stdout.splitlines():
+        if "MIN=" in line:
+            try:
+                return float(line.split("MIN=")[1].split()[0])
+            except (IndexError, ValueError):
+                pass
+    return None
 
 
-def compare(r_dir, rust_dir, label, report, method="PLS1"):
+def compare(r_dir, rust_dir, label, report, method="PLS1", band=None):
     ok = True
 
     missing = [f for f in EXPECTED_FILES if not (rust_dir / f).exists()]
@@ -225,18 +243,21 @@ def compare(r_dir, rust_dir, label, report, method="PLS1"):
     only_u = sorted(u_edges - r_edges)
     jac = len(r_edges & u_edges) / len(r_edges | u_edges) if (r_edges | u_edges) else 1.0
     if method == "MLR":
-        # Scored against R's measured self-disagreement, not against equality.
-        if jac < MLR_SEED_JACCARD:
+        # Scored against R's self-disagreement measured on THIS configuration.
+        if band is None:
+            report.append(f"  FAIL {label}: could not measure R's seed band")
+            ok = False
+        elif jac < band:
             report.append(
                 f"  FAIL {label}: Jaccard {jac:.4f} is below R's own seed-to-seed "
-                f"agreement of {MLR_SEED_JACCARD:.4f}\n"
+                f"agreement on this configuration ({band:.4f})\n"
                 f"    only in R:    {only_r[:10]}\n    only in Rust: {only_u[:10]}"
             )
             ok = False
         else:
             report.append(
                 f"  edges: R={len(r_edges)} Rust={len(u_edges)} Jaccard={jac:.4f} "
-                f"(R's own seed spread: {MLR_SEED_JACCARD:.4f}) symmetric difference={len(only_r)+len(only_u)}"
+                f"INSIDE R's own seed spread ({band:.4f}); symmetric difference={len(only_r)+len(only_u)}"
             )
     elif only_r or only_u:
         report.append(
@@ -390,7 +411,10 @@ def main():
             print(report[-1], flush=True)
             continue
 
-        result = compare(r_out, u_out, name, report, ps.get("method", "PLS1"))
+        band = mlr_seed_band(ps) if ps.get("method") == "MLR" else None
+        if band is not None:
+            report.append(f"  R's own seed band on this configuration: {band:.4f}")
+        result = compare(r_out, u_out, name, report, ps.get("method", "PLS1"), band)
         if isinstance(result, tuple):
             ok, wa, wr = result
             worst_abs_overall = max(worst_abs_overall, wa)
