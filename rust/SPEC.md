@@ -355,6 +355,44 @@ coefficients for a collapsed group will differ because they are attached to a
 different member. That difference has a mechanism, and it is this one; it should
 be reported as such rather than absorbed into a tolerance.
 
+### 4.6 Instrumented state — where the port still diverges
+
+`equivalence/mlr_internals_probe.R` dumps R's per-target `relevantRegulators`,
+coefficient rownames and `allRegulators$filter` for a 12 x 20 x 20 job. On input
+where **this port detects zero cliques**, R produces **six groups**:
+
+```
+filter values: Model=8
+               TF_mc1_1_P=3  TF_mc1_1_R=1
+               TF_mc1_2_P=2  TF_mc1_2_R=1
+               TF_mc1_3_P=1  TF_mc1_3_R=1
+               TF_mc1_4_P=2  TF_mc1_4_R=1
+               TF_mc1_5_P=2  TF_mc1_5_R=1
+               TF_mc1_6_P=2  TF_mc1_6_R=1
+
+G3  coefficients: (Intercept), Group_1_0, R6, R16,
+                  TF_mc1_1_R, TF_mc1_2_R, TF_mc1_3_R, TF_mc1_4_R, ...
+    relevantRegulators: all 20
+```
+
+Three concrete facts to work from, none of them guesses:
+
+1. **The clique detection is wrong.** Six groups covering 12 of 20 regulators
+   versus zero found. Either the correlation is being computed over the wrong
+   vectors, or the complete-clique test rejects components R accepts. Note the
+   group sizes here are 2-4, so they are small cliques, not one large component.
+2. **The group naming is `<omic>_mc1_<i>_R`, not `<omic>_mc<i>_R`.** The port
+   emits the latter. This matters because `ResultsPerTargetF.i.mlr` matches
+   selected variables against the `filter` column by exactly this string.
+3. **Grouping precedes interaction construction.** R's coefficient rownames
+   include `Group_1_0:TF_mc1_1_R` — interactions are built on the *representative*
+   column, after collapsing. The port collapses before `design::build` too, so
+   this ordering is right, but it must stay that way.
+
+The port currently reaches Jaccard 0.4632 (mlr-small) and 0.3434 (mlr-denser)
+against R's own 0.854 seed band. Fixing (1) is the next step, and (2) must land
+with it or the expansion will not match even once the cliques are right.
+
 ## 5. Output contract (`runMORE.R:501-602`)
 
 Byte-exact. `<seed>` is `--date_seed`, `<name>` is the sanitised omic name
