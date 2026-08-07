@@ -274,6 +274,40 @@ Reference sources for whichever route is chosen are dumped alongside this spec's
 notes: `GetMLR`, `ElasticNet`, `ResultsPerTargetF.i.mlr`, `CollinearityFilter1`,
 `CollinearityFilter2`, `modelcharac`.
 
+### 4.4 Why the current MLR port under-reports — diagnosed
+
+The elastic net is implemented (`src/elasticnet.rs`) and the harness scores it
+at Jaccard 0.22-0.34 against R, with **precision 0.67-0.89 but recall
+0.25-0.36**. The port selects too few edges.
+
+The cause is *not* the solver, and not alpha selection. `equivalence/
+mlr_alpha_probe.R` drives `cv.glmnet` exactly as `ElasticNet` does and shows R's
+`cvup` rule choosing **alpha = 1.0 with 2 non-zero coefficients** — a sparse
+lasso solution, the same shape this port produces.
+
+The difference is what reaches the rpc table. On the MLR branch
+`GetPairs1targetFAllReg` reports `relevantRegulators`, not
+`significantRegulators`, and `ResultsPerTargetF.i.mlr:154-179` builds that set
+in two steps:
+
+1. `relevantRegulators <- myvariables` — the variables with non-zero coefficients;
+2. **collinearity-group expansion**: for any selected variable that is a group
+   *representative* (matched against the `filter` column with `_P`/`_N`/`_R`
+   stripped), every original regulator in that group is added and the
+   representative itself removed.
+
+So two lasso-selected variables can legitimately become a dozen reported edges.
+With correlated regulators — which is the normal case in real omics data, and
+what the synthetic sets reproduce — `CollinearityFilter1/2` (`correlation = 0.7`)
+collapses them into groups, the lasso picks one representative, and the group
+expands back out.
+
+**`CollinearityFilter1/2` is therefore the missing piece, and it is a
+prerequisite for MLR equivalence, not an optimisation.** It is unimplemented
+here. Until it exists the port cannot reproduce the MLR edge set no matter how
+good the elastic net is, because the reported set is a function of the grouping,
+not only of the selection.
+
 ## 5. Output contract (`runMORE.R:501-602`)
 
 Byte-exact. `<seed>` is `--date_seed`, `<name>` is the sanitised omic name
