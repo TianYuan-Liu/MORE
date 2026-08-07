@@ -476,16 +476,45 @@ near-perfectly correlated with its own `Group_A:R1` and `Group_B:R1` and with
 little else. That structure produces precisely small disjoint cliques of size
 2-4, in the observed count.
 
-So `CollinearityFilter1` is very likely receiving the matrix **after**
-`RegulatorsInteractions`, not before — the opposite of the ordering this port
-assumes and of what §4.6 fact (3) inferred from the coefficient rownames.
+**This too is falsified.** `MORE_MLR.R` orders them the other way:
 
-Next step, and it is a read rather than a code change: establish the actual
-order of `RegulatorsInteractions` and `CollinearityFilter1` inside
-`ResultsPerTargetF.i.mlr` (`../R/MORE_MLR.R:501+`), and confirm whether
-`res$RegulatorMatrix` at the filter call site already contains interaction
-columns. If it does, the port must collapse **after** building the design, not
-before, and group members become design columns rather than regulators.
+```
+609  res = CollinearityFilter1(data = res$RegulatorMatrix, ...)
+633  des.mat2EN = RegulatorsInteractions(interactions, reguValues = res$RegulatorMatrix, ...)
+```
+
+The filter runs *before* interactions are built, so it does receive the raw
+regulator matrix. The port's ordering was right all along.
+
+### 4.10 An unresolved contradiction — stop and reproduce it first
+
+Two measurements now conflict, and both were taken directly:
+
+* R's own `igraph` pipeline, on the raw 20-regulator matrix, reports
+  **1 component, 21 edges, 0 complete components** — nothing to collapse;
+* R's actual `more(method="MLR")` run over a job built from that same matrix
+  reports **6 groups**, `TF_mc1_1_R … TF_mc1_6_R`, sizes 2-4.
+
+Both cannot be true of the same input, so the inputs must differ. The
+standalone igraph check reconstructed the regulator matrix from the generator
+formula; the `more()` run passed it through `GetMLR`'s own pre-filters. The
+difference is therefore somewhere in what `GetMLR` does to `regulatoryData`
+before `ResultsPerTargetF.i.mlr` sees it — the `Inf` filter, the `percNA`
+filter, `LowVariationRegu`, the sample-level NA filter, or the ID mangling —
+any of which can change the surviving column set and hence the graph.
+
+**Do not propose another mechanism.** Reproduce the contradiction first: inside
+a live `more(method="MLR")` run, dump `dim(res$RegulatorMatrix)`,
+`colnames(res$RegulatorMatrix)` and the resulting `mycor` for a single target,
+and compare that matrix against the standalone reconstruction. Whichever of the
+two the port matches tells you which side is wrong.
+
+Five mechanisms have now been proposed on this path and four were falsified by
+measurement — alpha selection, iterative peeling, binary correlation kind, and
+interaction ordering. Only group expansion was real, and it was found by
+instrumenting rather than by reasoning. The pattern is the finding: on this
+code path, reading the source produces plausible wrong answers at a high rate,
+and only dumping live intermediates has produced correct ones.
 
 ## 5. Output contract (`runMORE.R:501-602`)
 
