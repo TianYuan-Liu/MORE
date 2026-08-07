@@ -1,0 +1,27 @@
+[package]
+name = "more-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of the MORE regulatory-model kernel, drop-in at the PaintOmics runMORE.R seam"
+license = "GPL-2.0"
+
+[[bin]]
+name = "more-rs"
+path = "src/main.rs"
+
+[dependencies]
+# CLI surface must mirror runMORE.R's optparse options exactly.
+clap = { version = "4", features = ["derive"] }
+# Fan-out across target features only, never within a fit.
+rayon = "1"
+# Student-t CDF for the jackknife p-values. Pure Rust, so the musl static
+# build stays a one-liner. No BLAS: phase-1 profiling put BLAS at 0.1% of
+# runtime and the per-target matrices are ~20 rows, where call overhead
+# dominates any kernel.
+statrs = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
