@@ -126,6 +126,21 @@ fn fit_one(
     // MLR models the response on its own scale and fits an intercept; PLS1
     // is handed a scaled response (ResultsPerTargetF.i:107).
     if params.method == crate::cli::Method::Mlr {
+        // MORE_RS_DEBUG_MLR dumps the port's side of what
+        // equivalence/mlr_internals_probe.R dumps for R, so the two can be
+        // diffed directly instead of hypothesised about.
+        if std::env::var_os("MORE_RS_DEBUG_MLR").is_some() {
+            eprintln!(
+                "DBG {} model_regs={} groups={} cols={}",
+                target,
+                design.regulators.iter().filter(|r| r.filter == crate::prep::Filter::Model).count(),
+                groups.len(),
+                design.columns.len()
+            );
+            for g in &groups {
+                eprintln!("DBG   group {} members={:?}", g.name, g.members);
+            }
+        }
         return fit_one_mlr(target, y_raw, design, &groups);
     }
 

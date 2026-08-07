@@ -393,6 +393,33 @@ The port currently reaches Jaccard 0.4632 (mlr-small) and 0.3434 (mlr-denser)
 against R's own 0.854 seed band. Fixing (1) is the next step, and (2) must land
 with it or the expansion will not match even once the cliques are right.
 
+### 4.7 Both sides dumped — the observation, without a theory attached
+
+`MORE_RS_DEBUG_MLR=1` makes the binary emit the port's counterpart of what
+`equivalence/mlr_internals_probe.R` emits for R. On identical input
+(12 targets x 20 regulators x 20 samples, `minVariation = 0`):
+
+| | R | port |
+| --- | --- | --- |
+| Model regulators per target | 20 | 20 |
+| collinearity groups | **6**, sizes 2-4, covering 12 regulators | **0** |
+| design columns | — | 62 (20 regulators + 40 interactions + 2 design) |
+
+Independently measured on the same regulator matrix: **21 pairs at
+`|r| >= 0.7`, max `|r| = 1.0`**. So the edges are present and the port's
+correlations are not the problem; its *component handling* is. A single pass
+that rejects any component failing `nedges == csize*(csize-1)/2` finds nothing,
+where R arrives at six small cliques.
+
+The obvious reconciliation is that R decomposes or peels large components rather
+than discarding them — `GetMLR` calls `CollinearityFilter1` at `MORE_MLR.R:609`
+and the surviving representative re-enters the regulator table, so repeated
+application is plausible. **That is explicitly a hypothesis and is recorded as
+one.** Three previous mechanism guesses on this path were reasoned from the R
+source and two were wrong; the only one that moved the number came from a
+measurement. Verify by instrumenting how many times `CollinearityFilter1` runs
+per target and what `mycor` contains on each pass, before changing any code.
+
 ## 5. Output contract (`runMORE.R:501-602`)
 
 Byte-exact. `<seed>` is `--date_seed`, `<name>` is the sanitised omic name
