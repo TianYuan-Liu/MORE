@@ -260,6 +260,7 @@ mod tests {
         }
         Omic {
             name: name.to_string(),
+            input_data: data.clone(),
             data,
             associations: assoc,
             omic_type: 0,

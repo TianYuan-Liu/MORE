@@ -41,7 +41,17 @@ impl Filter {
 /// One regulatory omic after preparation.
 pub struct Omic {
     pub name: String,
+    /// The modelling matrix: high-NA and low-variation regulators removed.
     pub data: Frame,
+    /// The matrix as read from disk, column-subset to the common samples and
+    /// nothing else — R's `regulatoryData[[name]]`. Its regulator filters never
+    /// touch that object because they run inside MORE, on MORE's own copy.
+    ///
+    /// The values and association files are built from this, not from `data`,
+    /// so a regulator MORE refused to model still contributes its
+    /// `GENE:::REGULATOR` rows to PA Step 1. Significance only drives the
+    /// yellow-star overlay.
+    pub input_data: Frame,
     pub associations: Option<Vec<Association>>,
     /// 0 = numeric, 1 = binary — MORE's `omicType`, inferred by `isBin`.
     pub omic_type: u8,

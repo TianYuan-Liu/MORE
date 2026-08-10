@@ -421,13 +421,15 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn omic(name: &str, regs: &[(&str, Vec<f64>)], binary: bool) -> Omic {
+        let data = Frame {
+            row_names: regs.iter().map(|(n, _)| n.to_string()).collect(),
+            col_names: (0..regs[0].1.len()).map(|i| format!("S{i}")).collect(),
+            values: regs.iter().map(|(_, v)| v.clone()).collect(),
+        };
         Omic {
             name: name.into(),
-            data: Frame {
-                row_names: regs.iter().map(|(n, _)| n.to_string()).collect(),
-                col_names: (0..regs[0].1.len()).map(|i| format!("S{i}")).collect(),
-                values: regs.iter().map(|(_, v)| v.clone()).collect(),
-            },
+            input_data: data.clone(),
+            data,
             associations: None,
             omic_type: if binary { 1 } else { 0 },
             removed_na: HashSet::new(),

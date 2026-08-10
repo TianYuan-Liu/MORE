@@ -4,7 +4,8 @@
 
 ```sh
 cd rust
-cargo test           # 113 unit tests, incl. 7 against live ropls/MORE output
+cargo test           # 140 unit tests (incl. 7 against live ropls/MORE output)
+                     # plus the end-to-end output-contract test in tests/
 cargo build --release
 ```
 
@@ -40,22 +41,24 @@ docker run --rm --platform linux/amd64 \
 
 ## Wiring it in behind an env flag
 
-`runMORE.R` stays the fallback. The intended seam in `MOREServlet.py` is to
-choose the binary when it is present and the flag is set, and to fall back to
-`Rscript runMORE.R` otherwise — same arguments either way, since the CLI
-surfaces match:
+**Applied** (2026-08-10) in `MOREServlet._resolveMOREBackend`. Set
+`PAINTOMICS_MORE_RS` to the binary's absolute path; leave it unset and every
+job shells out to `Rscript runMORE.R` exactly as before. The arguments are the
+same either way, because the CLI surfaces match option for option.
 
-```python
-more_bin = os.environ.get("PAINTOMICS_MORE_RS")
-if more_bin and os.path.exists(more_bin):
-    cmd = [more_bin] + args
-else:
-    cmd = ["Rscript", RUNMORE_R] + args
-```
+R wins in three cases, each of which would otherwise be a silent failure:
 
-Not yet applied to `PaintomicsServer` — the port covers PLS1 only, and
-`--method MLR` deliberately exits with a message pointing back at `runMORE.R`
-rather than silently doing something different.
+* `--method MLR`, and any method the port does not recognise. The port covers
+  PLS1 only and exits pointing back at `runMORE.R` rather than silently doing
+  something different, so routing MLR to it would turn a working analysis into
+  a failed one.
+* A configured path that is not on disk — the binary ships separately from the
+  server and is absent from the deploy image, so a stale setting must degrade
+  rather than take MORE down.
+* A configured path without the executable bit, which an unpacked archive
+  loses easily.
+
+`PaintomicsServer/src/tests/test_more_backend_selection.py` pins all three.
 
 ## Equivalence
 
@@ -66,3 +69,60 @@ RUNMORE_R=/path/to/runMORE.R python3 equivalence/run_equivalence.py
 
 Requires R with `MORE` and `optparse` installed. Writes a provenance record to
 `equivalence/fixtures/equivalence_report.json`.
+
+### Against the bundled PaintOmics example
+
+The synthetic sets above are generated to exercise the kernel. The shipped
+`06-regulatory-more` dataset (250 targets, two regulatory omics of 40
+regulators each, 12 samples, 4 conditions, PLS1, `minVariation=NA`) is the
+end-to-end check, and R is deterministic on it — two independent runs produced
+byte-identical output for all seven files, so no seed band is needed.
+
+Measured 2026-08-10, R 4.6.0 / MORE 1.0.1, on **two** configurations — with the
+association files, and with `--assoc_files NULL`, which PaintOmics reaches
+whenever an omic is submitted without associations:
+
+| File | With associations | `--assoc_files NULL` |
+| --- | --- | --- |
+| `MORE_output_*` | byte-identical | byte-identical |
+| `MORE_relevant_assoc_*` | byte-identical | byte-identical |
+| `MORE_relevant_pairs_*` | byte-identical | byte-identical |
+| `MORE_rpc_*` | same rows, **different order** | byte-identical |
+
+The rpc rows are identical as a multiset — every value, including sign, agrees
+to the byte. They differ only in which omic comes first within a target: MORE
+orders them by omic name under R's collation (`miRNA-seq` before
+`Transcription_factor`, independent of `--omic_names` order — verified by
+swapping the declaration order and getting the same output order), while the
+port emits them in declaration order. That collation is locale-dependent —
+`LC_COLLATE=C` would flip R's own order — so it is deliberately not
+reproduced. `PathwayAcquisitionJob` reads the file into a dict-per-row for the
+Step-3 panel, where the only order-sensitive behaviour is the 100 000-row
+`df.head` cap, and that cap already truncates an arbitrary order under R.
+
+Those runs also **found three real divergences**, all since fixed. None was
+caught by the synthetic sets above, because each needs a condition the
+generator never produces:
+
+1. **The values and association files were built from the *modelling* matrix**
+   rather than the input matrix, so every pair whose regulator had been dropped
+   by the high-NA or low-variation filter went missing — 94 of 750 TF pairs and
+   36 of 750 miRNA pairs. R builds them from `regulatoryData[[name]]`, which its
+   regulator filters never touch because they run inside MORE on MORE's own
+   copy. `prep::Omic` now carries `input_data` alongside `data` for this.
+2. **`--assoc_files NULL` produced an empty values file.** With no association
+   file there is no input pair set to snapshot, and R falls back to MORE's own
+   significant pairs; the port returned nothing, writing a values file with only
+   a header while reporting 5313 significant pairs. `full_pairs` now takes the
+   significant set as that fallback.
+3. **`format_r_double` modelled R's fixed/scientific switch as a threshold**
+   (`e < -5 || e >= 15`). R has no such threshold: it renders both forms at 15
+   significant digits and keeps the shorter, preferring fixed on a tie. So R
+   writes `7.255e-05` where the port wrote `0.00007255`, and `1e+05` where it
+   wrote `100000`. Values parse identically either way — the consumer runs
+   `pd.to_numeric` — but it broke byte-comparison on any table containing small
+   coefficients, which is every table where all regulators enter the model.
+
+`tests/values_file_carries_every_input_pair.rs` guards (1) and (2) end-to-end
+through the real binary; (3) is pinned by a unit test carrying the R oracle
+values.

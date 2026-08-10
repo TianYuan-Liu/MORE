@@ -269,6 +269,7 @@ fn run(opts: &Options) -> Result<(), String> {
         omics.push(Omic {
             name: opts.omic_names[i].clone(),
             data: data_final,
+            input_data: frame,
             associations: assoc_per_omic[i].clone(),
             omic_type,
             removed_na,
@@ -322,9 +323,9 @@ fn run(opts: &Options) -> Result<(), String> {
     );
 
     for omic in &omics {
-        let full = output::full_pairs(omic);
         let sig = output::significant_pairs(&results, &omic.name);
-        output::write_omic_files(dir, &opts.date_seed, &omic.name, &full, &sig, &omic.data)?;
+        let full = output::full_pairs(omic, &sig);
+        output::write_omic_files(dir, &opts.date_seed, &omic.name, &full, &sig, &omic.input_data)?;
         println!(
             "MORE: {} — wrote {} pairs to values file ({} significant for yellow stars)",
             omic.name,
