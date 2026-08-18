@@ -211,8 +211,14 @@ this is how an interaction term `Group_Treat:TF-1` credits regulator `TF-1`.
 given the inputs, so the equivalence harness can demand tight numerics here and
 must not attribute any edge-set difference to seed variation.
 
-## 4. MLR (`method="MLR"`, `varSel="EN"`) — NOT PORTED, and why the
-##    acceptance criterion has to change
+## 4. MLR (`method="MLR"`, `varSel="EN"`)
+
+> **Status, 2026-08-18: PORTED and shipped as an opt-in engine.** This section
+> is kept as the investigation record — it was written while MLR was unported
+> and its early subsections propose mechanisms that later measurement
+> falsified. Read §4.13 first; it supersedes every conclusion below about
+> whether R's RNG can be reproduced (it can, exactly) and about what the
+> acceptance criterion should be.
 
 `GetMLR` → `ResultsPerTargetF.i.mlr` → `ElasticNet`. It differs from PLS1 in two
 ways that matter far more than the change of estimator:
@@ -872,3 +878,169 @@ Still open and independent of the RNG:
 * **Clique membership differs** for one group (R's `{R5,R7,R14}` vs the port's
   `{R7,R14}` with R5 elsewhere) — the component-splitting tie of §4.11.1,
   also `sample()`-driven.
+
+## §4.13 RESOLVED: R's RNG stream is reproduced exactly (2026-08-18)
+
+Everything above this line was written while MLR was unported, and its recurring
+conclusion — that matching R's MLR "would need R's Mersenne-Twister stream", and
+that this made edge-set equality unreachable — treated that as a wall. It is not
+a wall. It is about sixty lines of Rust, and it works.
+
+`src/rrng.rs` transcribes R 4.6.0's own C: `do_setseed`'s 50-round scramble,
+`RNG_Init`'s 625-word fill, `FixupSeeds`, `MT_genrand` with R's tempering,
+`fixup`, `R_unif_index`/`rbits` under `sample.kind = "Rejection"`, and
+`do_sample`'s without-replacement loop. It reproduces `runif` to the bit and
+`sample()` exactly.
+
+### How the RNG surface was established
+
+By instrumenting, not by reading — and the distinction earned its keep
+immediately. `equivalence/rng/trace_rng.R` and `trace_shim.R` unlock
+`base::sample` in `baseenv()` and install a pass-through recorder, so a live
+`more()` (or a live `runMORE.R`) logs every draw in order.
+
+A plain `grep` for `sample(` in `R/` **misses two of the three call sites** if it
+also filters lines containing `#`, because `MORE_MLR.R:811` and `:860` both carry
+a trailing Spanish comment. Anyone auditing this path from grep output alone will
+conclude there is one draw where there are three. The reachable sites are:
+
+| site | R | when |
+| --- | --- | --- |
+| pair representative | `MORE_MLR.R:811` `sample(correlacionados, 1)` | `nrow(mycor) == 1`, once |
+| clique representative | `MORE_MLR.R:860` `sample(correlacionados, 1)` | once per **complete** component |
+| star-peel tie-break | `MORE_MLR.R:922` `sample(names(which(sums == max(sums))), 1)` | only on a degree **and** sum tie |
+| `cv.glmnet` folds | `foldid = sample(rep(seq(nfolds), length = N))` | 11 per target, one per alpha |
+
+`CollinearityFilter2`'s three (`:1049`, `:1098`, `:1160`) are unreachable —
+`GetMLR` passes `col.filter = 'cor'`. `p.coef.pls2`'s (`auxFunctions.R:732`) is
+the `varSel = "Perm"` path `runMORE.R` never takes. PLS1 reaches none, which is
+why it was already byte-exact.
+
+Traces match **exactly** on every dataset tried:
+
+| dataset | draws | mismatches |
+| --- | --- | --- |
+| 12 targets x 20 regulators x 20 samples | 144 | **0** |
+| bundled simulated `06-regulatory-more`, two omics | 2830 | **0** |
+| bundled real `11-stategra-more`, 957 targets | 8157 | **0** |
+
+Collinearity-representative mismatches in the rpc table: **0 of 1555** on the
+real dataset, **0 of 766** on the simulated one.
+
+### Three things had to be fixed before the stream could line up
+
+1. **`CollinearityFilter1` correlates the scaled matrix.** It computes
+   `cor()` on `data2 = scale(data, scale, center)`; the port correlated raw
+   values. Pearson is scale-invariant so the two agree to ~15 digits — and that
+   is not enough, because R's tie-break asks `which(sums == max(sums))`, exact
+   float equality, and *whether that returns one index or two decides whether R
+   draws at all*. A last-bit disagreement does not perturb the answer slightly;
+   it desynchronises the stream from that point on. Measured: the raw-value
+   route put R2 and R18 one ULP apart (2.41215984486646562 against
+   ...517) where R has them equal, so the port took R2 outright while R drew
+   between R18 and R2. `r_scale_column` and `r_cor` transcribe R's `scale.default`
+   and `cov.c` (including its two-pass mean refinement and the clamp at 1).
+
+2. **igraph's vertex order.** `graph_from_data_frame(mycor)` numbers vertices by
+   first appearance scanning each edge row left column then right, and component
+   ids follow that numbering. Both matter: the component index names the group
+   (`<omic>_mc<i>_R`) and the member order **is the vector `sample()` indexes
+   into**. Derived from `mycor` now, not from the port's own node order.
+
+3. **The design column order.** `CollinearityFilter1` does not leave a
+   representative where it was: it *appends* a row
+   (`reg.table = rbind(reg.table, reg.table[keep,])`, `MORE_MLR.R:869`) and
+   rewrites the original's `filter`. So R's design column order is
+   [Model regulators never grouped, original order] ++ [representatives, in group
+   order]. `model::order_like_r` reproduces it, and `design_diff` now reports
+   **18/18 columns positionally identical by value** on the probe job. This is
+   not cosmetic — see the tolerance discussion below.
+
+### Parallelism survives, via a two-phase pass
+
+A single stream forces sequential order, and MLR is the expensive method:
+single-threaded, the port did not finish the 957-target STATegra example inside
+**ten minutes** (R takes ~740 s, so serialising would have made the port
+*slower than R* — consistent with the earlier finding that it burns ~2.3x R's
+CPU and wins only on rayon).
+
+So `fit_all` splits. Phase 1 walks the targets in order and takes only the draws
+(`draw_for_target`); phase 2 fans the elastic net over rayon with the draws in
+hand. Phase 2 touches the stream not at all, so the fan-out cannot perturb it —
+verified by the trace still matching 8157/8157 after the split. **25 s** for the
+real example.
+
+### `DESCENT_THRESH` goes back to MORE's own `epsilon = 1e-5`
+
+The 1e-7 in §4.12 was tuned while the port picked representatives by its own
+rule and therefore built a *different design matrix*. With the stream and the
+column order fixed, that justification is gone, and measurement now runs the
+other way. On the real example, port against `runMORE.R`:
+
+| tolerance | edge Jaccard | sym.diff. | identical R2 | worst coeff | seconds |
+| --- | --- | --- | --- | --- | --- |
+| 1e-7 | 0.9879 | 19 | 7/719 | 3.26e+01 | 217 |
+| **1e-5** | **0.9911** | **14** | **87/719** | **2.11e+00** | **25** |
+
+At 1e-7 the port systematically over-fits real `p > n` designs — it lands on
+near-unpenalised fits where R lands on penalised ones, which is where the
+3.26e+01 coefficient comes from. 1e-5 is faithful, better on every fidelity
+axis, and 9x faster. The cost is 3 edges on one synthetic set; see
+`KNOWN_MLR_DIVERGENCE`.
+
+### What is NOT reachable, and why that is R's property rather than the port's
+
+MORE runs glmnet at `epsilon = 1e-5`, where coordinate descent **has not
+converged**. glmnet's own objective on one fit (`des_03`, alpha 0.1, lambda
+2.7755594e-03):
+
+| `thres` | objective | `norm(b, 1)` |
+| --- | --- | --- |
+| 1e-5 — MORE's value | 2.682616e-02 | 9.646 |
+| 1e-8 | 2.641452e-02 | 10.148 |
+| 1e-12 | 2.640745e-02 | 10.164 |
+| 1e-14 | 2.640738e-02 | 10.164 |
+
+Worse, at 1e-5 glmnet's answer **is not a function of the data**. Permuting the
+design columns cannot move the optimum, yet it moves the result:
+
+| `thres` | objective spread (rel.) | `norm(b, 1)` range |
+| --- | --- | --- |
+| 1e-5 | 3.0e-03 | [9.5923, 9.6574] |
+| 1e-12 | 5.4e-07 | [10.1638, 10.1638] |
+
+So "reproduce R's coefficients exactly" is ill-posed: R does not reproduce itself
+under a relabelling of its own inputs. The only bar an independent implementation
+can be held to is the one the brief already uses for stochastic paths — inside
+R's own measured spread. Comparing the port's coefficient gap against R's gap to
+itself under that neutral permutation (alpha 0.1, rung 81, 1e-5):
+
+| design | R vs R (median / worst) | port vs R |
+| --- | --- | --- |
+| des_01 | 4.16e-03 / 8.30e-03 | 7.55e-03 |
+| des_03 | 6.91e-03 / 1.01e-02 | 9.67e-03 |
+| des_10 | 5.45e-03 / 1.21e-02 | **5.22e-03** (below R's median) |
+
+Inside the band in all three. Anything tighter would mean reproducing glmnet's
+Fortran iterate for iterate — pinning to glmnet 5.0's arithmetic rather than to
+MORE's model, which is a worse thing to depend on, not a better one.
+
+**Consequence for the product.** `rust-mlr` is offered and never substituted
+silently: `_resolveMOREBackend` sends MLR to the port only when a caller names
+`rust`, so `auto`, a stored job and an older client all keep getting R. PLS1
+earned a silent default by being byte-identical; this has not.
+
+### Measured summary, all three datasets
+
+| | probe 12x20x20 | simulated `06` (2 omics) | real `11-stategra` (957) |
+| --- | --- | --- | --- |
+| RNG draws matched | 144/144 | 2830/2830 | 8157/8157 |
+| representative mismatches | 0 | 0 | 0 |
+| files byte-identical | 2/4 | 4/7 | 2/4 |
+| edge Jaccard | 0.948 | 0.886 / 0.923 | **0.991** |
+| worst coefficient abs | 2.08e-01 | 1.20e-01 | 2.11e+00 |
+| runtime, R -> port | — | 201 s -> <1 s | ~740 s -> 25 s |
+
+The two files that come out byte-identical are the ID-only ones
+(`MORE_output_*` and `MORE_relevant_assoc_*`); the two that differ are the ones
+carrying coefficients or the significance-filtered pair list.

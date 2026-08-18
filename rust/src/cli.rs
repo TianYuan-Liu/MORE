@@ -57,6 +57,12 @@ struct Raw {
     filter_r2: f64,
     #[arg(long = "output_dir")]
     output_dir: String,
+    /// `more()`'s `seed` argument. `runMORE.R` never passes it, so production
+    /// runs the same stream R does; the harness needs it to drive R's other
+    /// seeds through the port. Distinct from `--date_seed`, which is a filename
+    /// prefix and touches no RNG.
+    #[arg(long = "seed", default_value_t = 123)]
+    seed: u32,
     #[arg(long = "date_seed", default_value = "results")]
     date_seed: String,
     /// Drop the condition x regulator interaction terms.
@@ -89,6 +95,8 @@ pub struct Options {
     pub filter_r2: f64,
     pub output_dir: String,
     pub date_seed: String,
+    /// `more()`'s RNG seed; 123 unless overridden.
+    pub seed: u32,
     pub interactions: bool,
 }
 
@@ -152,6 +160,7 @@ impl Options {
             filter_r2: raw.filter_r2,
             output_dir: raw.output_dir,
             date_seed: raw.date_seed,
+            seed: raw.seed,
             interactions: !raw.no_interactions,
         })
     }
@@ -204,6 +213,7 @@ mod tests {
             filter_r2: 0.0,
             output_dir: "out".into(),
             date_seed: "results".into(),
+            seed: 123,
             no_interactions: false,
         }
     }

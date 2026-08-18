@@ -126,3 +126,39 @@ generator never produces:
 `tests/values_file_carries_every_input_pair.rs` guards (1) and (2) end-to-end
 through the real binary; (3) is pinned by a unit test carrying the R oracle
 values.
+
+## Environment hooks
+
+None of these change what a production run does; they exist so the port can be
+compared against R rather than trusted.
+
+| variable | effect |
+| --- | --- |
+| `MORE_RS_RNG_TRACE=<file>` | log every RNG draw, in stream order, in the same shape `equivalence/rng/trace_shim.R` logs for R. Diffing the two is the acceptance gate for the MLR path — comparing outputs alone cannot tell "same answer" from "same answer by luck". |
+| `MORE_RS_DESCENT_THRESH=<f>` | override the coordinate-descent tolerance (default `1e-5`, MORE's own `epsilon`). Needed to compare against R with **both** sides converged, because at MORE's default glmnet is not. |
+| `MORE_RS_DEBUG_EDGES=1` | dump `myreg` order, the `mycor` edge list with correlations, and every star-peel decision (max degree, candidate set, summed `abs(r)`, the tie). |
+| `MORE_RS_DEBUG_MLR=1` | per-target groups, chosen `(alpha, lambda)`, non-zero count, deviance ratio. |
+| `MORE_RS_DEBUG_DESIGN=<dir>` | write each target's design matrix, response first, in the shape `equivalence/design_probe.R` dumps from R. |
+| `MORE_RS_CV_CURVE=<alpha>` | with `MORE_RS_EN_PROBE`, print every rung of the CV curve (`lambda`, `cvm`, `cvsd`, non-zero) for one alpha. Compare against `equivalence/cv_curve.R`, which prints `cv.glmnet`'s own. |
+| `MORE_RS_EN_PROBE=<tsv>` | run only the elastic net, on a design matrix dumped from R. |
+| `MORE_RS_EN_PATH=<alpha>` / `MORE_RS_EN_BETA=<rung>` / `MORE_RS_EN_THRESH=<f>` | lambda path, coefficients at one rung, tolerance for the probe. |
+| `MORE_RS_GROUPS_OVERRIDE=<dir>` | replay a collinearity grouping captured from R instead of computing one. **Bypasses the RNG draws, so a run using it is not stream-equivalent.** |
+
+### Reproducing the R comparison
+
+```sh
+# 1. a traced R run through the real product seam
+cat equivalence/rng/trace_shim.R \
+    ../../paintomics4/PaintomicsServer/src/common/bioscripts/runMORE.R > /tmp/runMORE_traced.R
+MORE_R_RNG_TRACE=/tmp/r_trace.tsv Rscript /tmp/runMORE_traced.R --method MLR ... --output_dir /tmp/r
+
+# 2. the port, same arguments
+MORE_RS_RNG_TRACE=/tmp/p_trace.tsv ./target/release/more-rs --method MLR ... --output_dir /tmp/p
+
+# 3. the streams must match row for row before any output claim is believed
+diff <(cut -f2-5 /tmp/r_trace.tsv) <(cut -f2-5 /tmp/p_trace.tsv) && echo "streams identical"
+```
+
+`MORE_R_EPSILON` on the R side (also provided by `trace_shim.R`) forces the
+tolerance glmnet is given, which is the only way to compare with both sides
+converged.
