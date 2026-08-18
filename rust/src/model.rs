@@ -62,6 +62,119 @@ pub struct FitParams {
     pub method: crate::cli::Method,
     /// MORE's `correlation` default; the collinearity threshold on the MLR path.
     pub correlation: f64,
+    /// `more()`'s `seed` (default 123). `runMORE.R` never overrides it, so
+    /// production always runs one fixed stream; it is a parameter so the
+    /// equivalence harness can drive R's other seeds through the port too.
+    pub seed: u32,
+}
+
+/// Put the design's regulator rows in the order R's `reg.table` ends up in.
+///
+/// `CollinearityFilter1` does not leave a group representative where it was. It
+/// **appends a new row** for it — `reg.table = rbind(reg.table, reg.table[keep,])`
+/// at MORE_MLR.R:869 — and rewrites the original row's `filter` to the group
+/// marker. The design is then built from that table, so its column order is
+/// [Model regulators that were never grouped, original order] followed by
+/// [group representatives, in the order the groups were created]. The port used
+/// to leave representatives in place, which is the same column *set* in a
+/// different order.
+///
+/// That is not cosmetic. At MORE's own `epsilon = 1e-5` glmnet's coordinate
+/// descent has not converged, so its answer depends on the order it sweeps the
+/// columns: permuting them moves the objective by 3.0e-03 relative, against
+/// 5.4e-07 once converged at 1e-12 (measured, `/tmp/perm.R` in the notes). A
+/// different column order is therefore a real numerical divergence from R, and
+/// one that no tolerance choice compensates for.
+fn order_like_r(
+    rows: Vec<crate::design::RegulatorRow>,
+    groups: &[crate::collinearity::Group],
+) -> Vec<crate::design::RegulatorRow> {
+    if groups.is_empty() {
+        return rows;
+    }
+    let rank = |name: &str| groups.iter().position(|g| g.representative == name);
+    let mut plain = Vec::with_capacity(rows.len());
+    let mut reps: Vec<(usize, crate::design::RegulatorRow)> = Vec::new();
+    for r in rows {
+        match rank(&r.regulator) {
+            Some(i) => reps.push((i, r)),
+            None => plain.push(r),
+        }
+    }
+    reps.sort_by_key(|(i, _)| *i);
+    plain.extend(reps.into_iter().map(|(_, r)| r));
+    plain
+}
+
+/// Everything on the MLR path that has to come off R's RNG, for one target.
+///
+/// The draws must happen in R's target order, which would force the whole fit
+/// to be sequential — and MLR is the expensive method, so that costs real
+/// wall-clock (measured: the STATegra example does not finish inside ten
+/// minutes single-threaded). Splitting the pass buys the parallelism back:
+/// phase 1 walks the targets in order and takes only the draws, phase 2 fans
+/// the elastic net out over rayon with the draws already in hand. Phase 2
+/// touches the stream not at all, so the fan-out cannot perturb it.
+///
+/// Phase 1 builds the design and throws it away, because the fold gate
+/// (`ncol(des.mat2) > 2`) depends on it. That duplicated work is a rounding
+/// error next to eleven cross-validated lambda paths per target.
+pub struct MlrDraws {
+    groups: Vec<crate::collinearity::Group>,
+    folds: Option<Vec<Vec<usize>>>,
+}
+
+fn draw_for_target(
+    target: &str,
+    y_raw: &[f64],
+    omics: &[Omic],
+    design_cols: &[String],
+    design_values: &[Vec<f64>],
+    params: &FitParams,
+    rng: &mut crate::rrng::RngStream,
+) -> MlrDraws {
+    let empty = MlrDraws { groups: Vec::new(), folds: None };
+    let mut regulators = design::all_regulators(target, omics);
+    if regulators.is_empty() {
+        return empty;
+    }
+    design::classify(&mut regulators, omics);
+    let n = y_raw.len();
+
+    let (groups, _skipped_binary) = match crate::collinearity::groups_from_override(target) {
+        Some(g) => (g, 0usize),
+        None => crate::collinearity::find_groups(&regulators, omics, params.correlation, rng),
+    };
+    let drop = crate::collinearity::suppressed(&groups);
+    let mut design_rows = regulators.clone();
+    design_rows.retain(|r| !drop.contains(&r.regulator));
+    let design_rows = order_like_r(design_rows, &groups);
+
+    let folds = match design::build(
+        &design_rows,
+        omics,
+        design_cols,
+        design_values,
+        n,
+        params.interactions,
+    ) {
+        // `ElasticNet` cross-validates only when
+        // `is.null(elasticnet) && ncol(des.mat2) > 2` (auxFunctions.R:534-543);
+        // `des.mat2` counts the response, so the port's gate is >= 2 predictor
+        // columns. Drawing where R would not — or skipping a draw it takes —
+        // desynchronises every later target, so this gate is transcribed
+        // rather than approximated.
+        Some((_, x)) if x.ncol() >= 2 => {
+            let k = crate::elasticnet::n_folds(n);
+            Some(
+                (0..crate::elasticnet::default_alphas().len())
+                    .map(|_| rng.fold_ids(n, k, "cv.glmnet/foldid"))
+                    .collect(),
+            )
+        }
+        _ => None,
+    };
+    MlrDraws { groups, folds }
 }
 
 /// Fit every target. The only shared mutable state is none — each target
@@ -75,16 +188,42 @@ pub fn fit_all(
     params: &FitParams,
 ) -> Vec<TargetResult> {
     let index = target_data.row_index();
-    targets
-        .par_iter()
-        .map(|t| {
-            let row = index.get(t.as_str()).map(|&r| target_data.values[r].as_slice());
-            match row {
-                Some(y) => fit_one(t, y, omics, design_cols, design_values, params),
-                None => TargetResult::failed(t, Vec::new(), "Target feature had no initial regulators"),
-            }
-        })
-        .collect()
+    let one = |t: &String, draws: Option<&MlrDraws>| {
+        let row = index.get(t.as_str()).map(|&r| target_data.values[r].as_slice());
+        match row {
+            Some(y) => fit_one(t, y, omics, design_cols, design_values, params, draws),
+            None => TargetResult::failed(t, Vec::new(), "Target feature had no initial regulators"),
+        }
+    };
+    if params.method == crate::cli::Method::Mlr {
+        // Phase 1, sequential: `set.seed(123)` is called once in `more()` and
+        // the stream then advances across every target in order, so the draws
+        // are taken here and nowhere else.
+        let mut rng = crate::rrng::RngStream::new(params.seed);
+        let draws: Vec<MlrDraws> = targets
+            .iter()
+            .map(|t| match index.get(t.as_str()) {
+                Some(&r) => draw_for_target(
+                    t,
+                    &target_data.values[r],
+                    omics,
+                    design_cols,
+                    design_values,
+                    params,
+                    &mut rng,
+                ),
+                None => MlrDraws { groups: Vec::new(), folds: None },
+            })
+            .collect();
+        // Phase 2, parallel: no draw happens here, so the order is free again.
+        targets
+            .par_iter()
+            .zip(draws.into_par_iter())
+            .map(|(t, d)| one(t, Some(&d)))
+            .collect()
+    } else {
+        targets.par_iter().map(|t| one(t, None)).collect()
+    }
 }
 
 fn fit_one(
@@ -94,6 +233,7 @@ fn fit_one(
     design_cols: &[String],
     design_values: &[Vec<f64>],
     params: &FitParams,
+    draws: Option<&MlrDraws>,
 ) -> TargetResult {
     let mut regulators = design::all_regulators(target, omics);
     if regulators.is_empty() {
@@ -110,12 +250,12 @@ fn fit_one(
     let mut groups = Vec::new();
     let mut design_rows = regulators.clone();
     if params.method == crate::cli::Method::Mlr {
-        let (g, _skipped_binary) = match crate::collinearity::groups_from_override(target) {
-            Some(g) => (g, 0usize),
-            None => crate::collinearity::find_groups(&regulators, omics, params.correlation),
-        };
+        // Taken in phase 1 so the draws land in R's order; recomputing them
+        // here would take them again, in whatever order rayon chose.
+        let g = draws.map(|d| d.groups.clone()).unwrap_or_default();
         let drop = crate::collinearity::suppressed(&g);
         design_rows.retain(|r| !drop.contains(&r.regulator));
+        design_rows = order_like_r(design_rows, &g);
         groups = g;
     }
 
@@ -172,7 +312,14 @@ fn fit_one(
             }
             let _ = std::fs::write(dir.join(format!("{target}.tsv")), out);
         }
-        return fit_one_mlr(target, y_raw, design, &groups);
+        // `ElasticNet` draws folds inside `cv.glmnet`, once per alpha, and only
+        // when it actually cross-validates: `is.null(elasticnet) && ncol(des.mat2) > 2`
+        // (auxFunctions.R:534-543). `des.mat2` counts the response, so the port's
+        // gate is >= 2 predictor columns. Drawing when R would not — or not
+        // drawing when it would — desyncs the stream for every later target,
+        // which is why this gate is transcribed rather than approximated.
+        let drawn_folds = draws.and_then(|d| d.folds.as_deref());
+        return fit_one_mlr(target, y_raw, design, &groups, drawn_folds);
     }
 
     let mut y = y_raw.to_vec();
@@ -255,12 +402,14 @@ fn fit_one_mlr(
     y_raw: &[f64],
     design: Design,
     groups: &[crate::collinearity::Group],
+    drawn_folds: Option<&[Vec<usize>]>,
 ) -> TargetResult {
     let fit = match crate::elasticnet::cv_fit(
         &design.x,
         y_raw,
         &crate::elasticnet::default_alphas(),
-        crate::elasticnet::DESCENT_THRESH,
+        crate::elasticnet::descent_thresh(),
+        drawn_folds,
     ) {
         Some(f) => f,
         None => {
@@ -349,6 +498,7 @@ mod tests {
         }
         Omic {
             name: name.into(),
+            input_data: data.clone(),
             data,
             associations: assoc,
             omic_type: 0,
@@ -389,7 +539,7 @@ mod tests {
     #[test]
     fn the_driving_regulator_is_selected() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7, seed: 123 };
         let res = fit_all(&["G1".to_string()], &target, &omics, &cols, &values, &params);
         assert_eq!(res.len(), 1);
         assert!(res[0].significant.contains(&"DRV".to_string()), "{:?}", res[0].significant);
@@ -398,7 +548,7 @@ mod tests {
     #[test]
     fn every_regulator_is_reported_even_when_not_significant() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7, seed: 123 };
         let res = fit_all(&["G1".to_string()], &target, &omics, &cols, &values, &params);
         assert_eq!(res[0].regulators.len(), 2);
         assert!(res[0].regulators.iter().all(|r| r.filter == Filter::Model));
@@ -407,7 +557,7 @@ mod tests {
     #[test]
     fn a_target_absent_from_the_expression_matrix_is_reported_not_dropped() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7, seed: 123 };
         let res = fit_all(&["MISSING".to_string()], &target, &omics, &cols, &values, &params);
         assert_eq!(res.len(), 1);
         assert!(res[0].problem.is_some());
@@ -416,7 +566,7 @@ mod tests {
     #[test]
     fn goodness_of_fit_is_reported_when_a_model_exists() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7, seed: 123 };
         let res = fit_all(&["G1".to_string()], &target, &omics, &cols, &values, &params);
         assert!(res[0].r2.is_some());
         assert!(res[0].ncomp.unwrap() >= 1);
@@ -425,7 +575,7 @@ mod tests {
     #[test]
     fn coefficients_are_returned_only_for_significant_variables() {
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7, seed: 123 };
         let res = fit_all(&["G1".to_string()], &target, &omics, &cols, &values, &params);
         assert!(!res[0].coefficients.is_empty());
         for (_, _, p) in &res[0].coefficients {
@@ -437,7 +587,7 @@ mod tests {
     fn fanning_out_gives_the_same_answer_as_one_target_at_a_time() {
         // The parallel path must not depend on how targets are batched.
         let (target, omics, cols, values) = scenario();
-        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7 };
+        let params = FitParams { alpha: 0.05, vip: 0.8, interactions: true, method: crate::cli::Method::Pls1, correlation: 0.7, seed: 123 };
         let many = fit_all(
             &["G1".to_string(), "G1".to_string(), "G1".to_string()],
             &target, &omics, &cols, &values, &params,

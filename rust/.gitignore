@@ -1,1 +1,3 @@
 target/
+equivalence/__pycache__/
+equivalence/rng/out/

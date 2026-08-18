@@ -43,20 +43,91 @@ pub struct Group {
 
 /// Pearson correlation. Under `scaleType = "auto"` R correlates the scaled
 /// matrix, and Pearson is scale-invariant, so scaling is a no-op here.
-fn pearson(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len() as f64;
-    if n < 2.0 {
+/// `scale(x, center = TRUE, scale = TRUE)` on one column, as
+/// `scale.default` does it: centre on `colMeans`, then divide by
+/// `sqrt(sum(v^2) / max(1, n - 1))` of the *centred* column.
+///
+/// Pearson correlation is scale-invariant, so this looks like a no-op — and
+/// mathematically it is. It is not numerically. `CollinearityFilter1`
+/// correlates `scale(data, scale, center)`, and the port used to correlate the
+/// raw values; the two agree to about 15 digits and differ in the last bits.
+/// That is normally beneath notice, but R's star-peel tie-break asks
+/// `which(sums == max(sums))` — **exact** float equality — and whether that
+/// returns one index or two decides whether R draws from its RNG at all. A
+/// last-bit disagreement therefore does not perturb the answer slightly; it
+/// desynchronises the entire stream from that point on. Measured: on the 20x20
+/// probe the raw-value route put R2 and R18 one ULP apart where R has them
+/// equal, so the port took R2 outright while R drew between them.
+fn r_scale_column(v: &[f64]) -> Vec<f64> {
+    let n = v.len();
+    let mut sum = 0.0f64;
+    for &x in v {
+        sum += x;
+    }
+    let centre = sum / n as f64;
+    let centred: Vec<f64> = v.iter().map(|&x| x - centre).collect();
+    let mut ss = 0.0f64;
+    for &x in &centred {
+        ss += x * x;
+    }
+    let denom = if n > 1 { (n - 1) as f64 } else { 1.0 };
+    let sd = (ss / denom).sqrt();
+    if !(sd > 0.0) {
+        return centred;
+    }
+    centred.iter().map(|&x| x / sd).collect()
+}
+
+/// `cor(x, y)` — R's `cov.c` for the complete/pearson case, including its
+/// two-pass mean refinement and the clamp at 1.
+///
+/// The refinement (`tmp += sum(x - tmp)/n`) is not decoration: it is what makes
+/// R's means, and therefore its correlations, land on the bits they do.
+fn r_cor(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len();
+    if n < 2 || b.len() != n {
         return f64::NAN;
     }
-    let ma = a.iter().sum::<f64>() / n;
-    let mb = b.iter().sum::<f64>() / n;
-    let cov: f64 = a.iter().zip(b).map(|(x, y)| (x - ma) * (y - mb)).sum::<f64>() / (n - 1.0);
-    let d = sd(a) * sd(b);
-    if !(d > 0.0) {
-        f64::NAN
-    } else {
-        cov / d
+    let refined_mean = |v: &[f64]| -> f64 {
+        let mut sum = 0.0f64;
+        for &x in v {
+            sum += x;
+        }
+        let mut m = sum / n as f64;
+        if m.is_finite() {
+            let mut adj = 0.0f64;
+            for &x in v {
+                adj += x - m;
+            }
+            m += adj / n as f64;
+        }
+        m
+    };
+    let (xm, ym) = (refined_mean(a), refined_mean(b));
+    let nm1 = (n - 1) as f64;
+    let mut sxy = 0.0f64;
+    let mut sxx = 0.0f64;
+    let mut syy = 0.0f64;
+    for k in 0..n {
+        sxy += (a[k] - xm) * (b[k] - ym);
     }
+    for &x in a {
+        sxx += (x - xm) * (x - xm);
+    }
+    for &y in b {
+        syy += (y - ym) * (y - ym);
+    }
+    let cov = sxy / nm1;
+    let xsd = (sxx / nm1).sqrt();
+    let ysd = (syy / nm1).sqrt();
+    if xsd == 0.0 || ysd == 0.0 {
+        return f64::NAN;
+    }
+    let mut r = cov / (xsd * ysd);
+    if r > 1.0 {
+        r = 1.0;
+    }
+    r
 }
 
 /// Find the cliques of correlated Model regulators.
@@ -136,6 +207,7 @@ pub fn find_groups(
     rows: &[RegulatorRow],
     omics: &[Omic],
     threshold: f64,
+    rng: &mut crate::rrng::RngStream,
 ) -> (Vec<Group>, usize) {
     let model: Vec<&RegulatorRow> = rows.iter().filter(|r| r.filter == Filter::Model).collect();
     if model.len() < 2 {
@@ -148,7 +220,7 @@ pub fn find_groups(
     // the entire filter and was the reason this found zero cliques on data
     // where R finds six.
     let mut model_ok: Vec<&RegulatorRow> = Vec::with_capacity(model.len());
-    let mut values: Vec<&[f64]> = Vec::with_capacity(model.len());
+    let mut values: Vec<Vec<f64>> = Vec::with_capacity(model.len());
     let mut binary: Vec<bool> = Vec::with_capacity(model.len());
     for r in &model {
         let Some(omic) = omics.iter().find(|o| o.name == r.omic) else {
@@ -158,7 +230,9 @@ pub fn find_groups(
             continue;
         };
         model_ok.push(r);
-        values.push(&omic.data.values[idx]);
+        // `CollinearityFilter1` correlates `data2 = scale(data, scale, center)`,
+        // never the raw matrix -- see `r_scale_column`.
+        values.push(r_scale_column(&omic.data.values[idx]));
         binary.push(omic.omic_type == 1);
     }
     let model = model_ok;
@@ -170,13 +244,19 @@ pub fn find_groups(
     let mut adj = vec![vec![false; n]; n];
     let mut corr = vec![vec![0.0f64; n]; n];
     let mut skipped_binary = 0usize;
+    // `mycorrelations` is `combn(myreg, 2)` — i ascending, then j — and `mycor`
+    // keeps that order after the threshold filter. The order is not cosmetic:
+    // it fixes igraph's vertex numbering (first appearance scanning each edge
+    // row left column then right), which fixes the component indices that name
+    // the groups AND the order of the vector `sample()` indexes into.
+    let mut mycor: Vec<(usize, usize)> = Vec::new();
     for i in 0..n {
         for j in (i + 1)..n {
             if binary[i] || binary[j] {
                 skipped_binary += 1;
                 continue;
             }
-            let r = pearson(values[i], values[j]);
+            let r = r_cor(&values[i], &values[j]);
             if r.is_nan() {
                 continue;
             }
@@ -185,14 +265,44 @@ pub fn find_groups(
             if r.abs() >= threshold {
                 adj[i][j] = true;
                 adj[j][i] = true;
+                mycor.push((i, j));
             }
         }
     }
 
-    // Connected components.
+    if std::env::var_os("MORE_RS_DEBUG_EDGES").is_some() {
+        eprintln!("DBG MYREG order: {}",
+            model.iter().map(|r| r.regulator.as_str()).collect::<Vec<_>>().join(","));
+        eprintln!("DBG EDGES {} over {} nodes", mycor.len(), n);
+        for &(a, b) in &mycor {
+            eprintln!("DBG   E {} {} {:.10}", model[a].regulator, model[b].regulator, corr[a][b]);
+        }
+    }
+
+    let mut groups = Vec::new();
+    let mut peel_order: Vec<(usize, usize, usize)> = Vec::new();
+    if mycor.is_empty() {
+        return (groups, skipped_binary);
+    }
+
+    // igraph's vertex order. R's `nrow(mycor) == 1` branch (MORE_MLR.R:805)
+    // needs no special case here: a lone edge is a two-node complete component,
+    // its `correlacionados` is that edge's two names in this same order, and it
+    // is named `_mc1_R` either way — so the general path below reproduces it,
+    // draw included.
+    let mut vorder: Vec<usize> = Vec::new();
+    for &(a, b) in &mycor {
+        for v in [a, b] {
+            if !vorder.contains(&v) {
+                vorder.push(v);
+            }
+        }
+    }
+
+    // Components, discovered in vertex order so the indices match igraph's.
     let mut component = vec![usize::MAX; n];
-    let mut n_components = 0;
-    for start in 0..n {
+    let mut n_components = 0usize;
+    for &start in &vorder {
         if component[start] != usize::MAX {
             continue;
         }
@@ -209,13 +319,11 @@ pub fn find_groups(
         n_components += 1;
     }
 
-    let mut groups = Vec::new();
     let mut collapsed = 0usize;
-    // Star-peel representatives in the order they were chosen. Membership is
-    // *not* decided here -- see the relabelling pass below.
-    let mut peel_order: Vec<(usize, usize, usize)> = Vec::new();
     for c in 0..n_components {
-        let members: Vec<usize> = (0..n).filter(|&i| component[i] == c).collect();
+        // `names(mycomponents$membership[mycomponents$membership == i])`.
+        let members: Vec<usize> =
+            vorder.iter().copied().filter(|&i| component[i] == c).collect();
         if members.len() < 2 {
             continue;
         }
@@ -229,20 +337,16 @@ pub fn find_groups(
             }
         }
         if edges == members.len() * (members.len() - 1) / 2 {
-            // Complete clique: collapse whole.
+            // Complete clique: collapse whole. `keep = sample(correlacionados, 1)`
+            // (MORE_MLR.R:860) — unconditional, once per complete component.
             collapsed += 1;
-            // MORE_RS_REP_LAST exists only to measure how much the clique
-            // representative matters: R draws it with sample(), so a run that
-            // differs only in this choice bounds that RNG site's contribution.
-            let rep = if std::env::var_os("MORE_RS_REP_LAST").is_some() {
-                members[members.len() - 1]
-            } else {
-                members[0]
-            };
+            let names: Vec<String> =
+                members.iter().map(|&i| model[i].regulator.clone()).collect();
+            let rep = members[rng.sample_one_of(&names, "CollinearityFilter1/clique")];
             groups.push(Group {
                 name: format!("{}_mc{}_R", model[rep].omic, collapsed),
                 representative: model[rep].regulator.clone(),
-                members: members.iter().map(|&i| model[i].regulator.clone()).collect(),
+                members: names,
                 signs: members
                     .iter()
                     .map(|&i| if i == rep || corr[rep][i] >= 0.0 { 1.0 } else { -1.0 })
@@ -265,51 +369,74 @@ pub fn find_groups(
             let degree = |v: usize, alive: &[bool]| -> usize {
                 (0..n).filter(|&w| alive[w] && adj[v][w]).count()
             };
-            let mut best: Option<usize> = None;
-            let mut best_deg = 0usize;
-            let mut best_sum = f64::NEG_INFINITY;
-            // How many nodes tie on BOTH degree and summed |r| — the point at
-            // which R falls back to sample() and this port cannot follow.
-            let mut tied = 0usize;
-            for &v in &members {
-                if !alive[v] {
-                    continue;
-                }
-                let d = degree(v, &alive);
-                if d == 0 {
-                    continue;
-                }
-                // Tie-break on the summed absolute correlation of the node's
-                // edges, as R does; R breaks a further tie with sample(), this
-                // takes the first in canonical order.
-                let sum: f64 =
-                    // R's tie-break sums |r| over the ORIGINAL `mycor` table:
-                    //   sums = sapply(maxcorrelationed, function(x)
-                    //            sum(abs(mycor[which(apply(mycor[,c(1,2)]==c(x),1,any)),3])))
-                    // `mycor` is built once, before any peeling, so a candidate
-                    // still earns credit for edges to regulators that have
-                    // already been swept away. Restricting this to `alive`
-                    // neighbours -- the intuitive reading -- makes genuine ties
-                    // out of decided cases: on the mlr-denser path the last
-                    // component leaves {R7, R14}, both degree 1, alive-sums both
-                    // 0.7137, whereas R gives R14 1.4237 through its dead edge
-                    // to R5 and picks it outright. That single column is worth
-                    // 31 of the 34 edges the port used to differ by, and it is
-                    // also why R's grouping does not move with the seed.
-                    (0..n).filter(|&w| adj[v][w]).map(|w| corr[v][w].abs()).sum();
-                if d > best_deg || (d == best_deg && sum > best_sum) {
-                    best = Some(v);
-                    best_deg = d;
-                    best_sum = sum;
-                    tied = 1;
-                } else if d == best_deg && (sum - best_sum).abs() < 1e-12 {
-                    tied += 1;
-                }
+            // `mynumedges = table(as_edgelist(mysubgraph))` counts only nodes
+            // that still carry an edge, and `table` returns them **sorted by
+            // name**. That sort is the order `sample()` indexes into, so it is
+            // reproduced rather than left as the port's own node order.
+            let mut live: Vec<(usize, usize)> = members
+                .iter()
+                .copied()
+                .filter(|&v| alive[v])
+                .map(|v| (v, degree(v, &alive)))
+                .filter(|&(_, d)| d > 0)
+                .collect();
+            if live.is_empty() {
+                break;
             }
-            let Some(rep) = best else { break };
-            if tied > 1 && std::env::var_os("MORE_RS_DEBUG_MLR").is_some() {
-                eprintln!("DBG   TIE degree={best_deg} among {tied} nodes -- R would sample()");
+            live.sort_by(|a, b| model[a.0].regulator.cmp(&model[b.0].regulator));
+            let max_deg = live.iter().map(|&(_, d)| d).max().unwrap();
+            let top: Vec<usize> =
+                live.iter().filter(|&&(_, d)| d == max_deg).map(|&(v, _)| v).collect();
+
+            if std::env::var_os("MORE_RS_DEBUG_EDGES").is_some() {
+                eprintln!("DBG PEEL c={} j={} max_deg={} top=[{}]", c, j + 1, max_deg,
+                    top.iter().map(|&v| model[v].regulator.as_str()).collect::<Vec<_>>().join(","));
             }
+            let rep = if top.len() == 1 {
+                top[0]
+            } else {
+                // R's tie-break sums |r| over the ORIGINAL `mycor` table:
+                //   sums = sapply(maxcorrelationed, function(x)
+                //            sum(abs(mycor[which(apply(mycor[,c(1,2)]==c(x),1,any)),3])))
+                // `mycor` is built once, before any peeling, so a candidate
+                // still earns credit for edges to regulators that have already
+                // been swept away. Restricting this to `alive` neighbours --
+                // the intuitive reading -- manufactures ties out of decided
+                // cases: on mlr-denser the last component leaves {R7, R14},
+                // both degree 1, alive-sums both 0.7137, whereas R gives R14
+                // 1.4237 through its dead edge to R5 and picks it outright.
+                let sums: Vec<f64> = top
+                    .iter()
+                    .map(|&v| mycor.iter()
+                        .filter(|&&(a, b)| a == v || b == v)
+                        .map(|&(a, b)| corr[a][b].abs())
+                        .sum())
+                    .collect();
+                let max_sum = sums.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                // `which(sums == max(sums))` is exact equality in R, and
+                // whether it returns one index or several decides whether the
+                // stream advances at all. Matching R's comparison is therefore
+                // part of matching its RNG, not a numerical nicety.
+                let tied: Vec<usize> = top
+                    .iter()
+                    .zip(&sums)
+                    .filter(|(_, &s)| s == max_sum)
+                    .map(|(&v, _)| v)
+                    .collect();
+                if std::env::var_os("MORE_RS_DEBUG_EDGES").is_some() {
+                    eprintln!("DBG   sums=[{}] max={:.17e} tied=[{}]",
+                        sums.iter().map(|s| format!("{s:.17e}")).collect::<Vec<_>>().join(","),
+                        max_sum,
+                        tied.iter().map(|&v| model[v].regulator.as_str()).collect::<Vec<_>>().join(","));
+                }
+                if tied.len() == 1 {
+                    tied[0]
+                } else {
+                    let names: Vec<String> =
+                        tied.iter().map(|&v| model[v].regulator.clone()).collect();
+                    tied[rng.sample_one_of(&names, "CollinearityFilter1/peel")]
+                }
+            };
 
             // The design loses this representative's *currently alive*
             // neighbours -- that is what determines the surviving columns.
@@ -421,13 +548,15 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn omic(name: &str, regs: &[(&str, Vec<f64>)], binary: bool) -> Omic {
+        let data = Frame {
+            row_names: regs.iter().map(|(n, _)| n.to_string()).collect(),
+            col_names: (0..regs[0].1.len()).map(|i| format!("S{i}")).collect(),
+            values: regs.iter().map(|(_, v)| v.clone()).collect(),
+        };
         Omic {
             name: name.into(),
-            data: Frame {
-                row_names: regs.iter().map(|(n, _)| n.to_string()).collect(),
-                col_names: (0..regs[0].1.len()).map(|i| format!("S{i}")).collect(),
-                values: regs.iter().map(|(_, v)| v.clone()).collect(),
-            },
+            input_data: data.clone(),
+            data,
             associations: None,
             omic_type: if binary { 1 } else { 0 },
             removed_na: HashSet::new(),
@@ -458,7 +587,7 @@ mod tests {
             false,
         );
         let rows = vec![row("A", "TF"), row("B", "TF"), row("C", "TF")];
-        let (groups, _) = find_groups(&rows, &[o], 0.7);
+        let (groups, _) = find_groups(&rows, &[o], 0.7, &mut crate::rrng::RngStream::new(123));
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members.len(), 3);
         assert_eq!(groups[0].name, "TF_mc1_R");
@@ -475,7 +604,7 @@ mod tests {
             false,
         );
         let rows = vec![row("A", "TF"), row("B", "TF")];
-        let (groups, _) = find_groups(&rows, &[o], 0.7);
+        let (groups, _) = find_groups(&rows, &[o], 0.7, &mut crate::rrng::RngStream::new(123));
         assert!(groups.is_empty());
     }
 
@@ -488,7 +617,7 @@ mod tests {
             false,
         );
         let rows = vec![row("A", "TF"), row("B", "TF")];
-        let (groups, _) = find_groups(&rows, &[o], 0.7);
+        let (groups, _) = find_groups(&rows, &[o], 0.7, &mut crate::rrng::RngStream::new(123));
         assert_eq!(groups.len(), 1);
     }
 
@@ -501,7 +630,7 @@ mod tests {
         let b: Vec<f64> = a.iter().zip(&c).map(|(x, y)| x + y).collect();
         let o = omic("TF", &[("A", a), ("B", b), ("C", c)], false);
         let rows = vec![row("A", "TF"), row("B", "TF"), row("C", "TF")];
-        let (groups, _) = find_groups(&rows, &[o], 0.7);
+        let (groups, _) = find_groups(&rows, &[o], 0.7, &mut crate::rrng::RngStream::new(123));
         for g in &groups {
             assert_eq!(g.members.len(), 2, "an incomplete component was collapsed");
         }
@@ -515,7 +644,7 @@ mod tests {
             true,
         );
         let rows = vec![row("A", "TF"), row("B", "TF")];
-        let (groups, skipped) = find_groups(&rows, &[o], 0.7);
+        let (groups, skipped) = find_groups(&rows, &[o], 0.7, &mut crate::rrng::RngStream::new(123));
         assert!(groups.is_empty());
         assert_eq!(skipped, 1);
     }
@@ -529,7 +658,7 @@ mod tests {
         let b: Vec<f64> = a.iter().map(|v| -v).collect();
         let rows = vec![row("A", "TF"), row("B", "TF")];
         let o = omic("TF", &[("A", a), ("B", b)], false);
-        let (groups, _) = find_groups(&rows, &[o], 0.7);
+        let (groups, _) = find_groups(&rows, &[o], 0.7, &mut crate::rrng::RngStream::new(123));
         assert_eq!(groups.len(), 1, "{groups:?}");
         let g = &groups[0];
         let member = g.members.iter().position(|m| m != &g.representative).unwrap();
@@ -577,7 +706,7 @@ mod tests {
     #[test]
     fn a_single_model_regulator_forms_no_group() {
         let o = omic("TF", &[("A", vec![1.0, 2.0, 3.0, 4.0])], false);
-        let (groups, _) = find_groups(&[row("A", "TF")], &[o], 0.7);
+        let (groups, _) = find_groups(&[row("A", "TF")], &[o], 0.7, &mut crate::rrng::RngStream::new(123));
         assert!(groups.is_empty());
     }
 }

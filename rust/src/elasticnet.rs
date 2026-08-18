@@ -82,27 +82,69 @@ fn soft(z: f64, g: f64) -> f64 {
 /// multiplies by `ys^2`. The criterion is quadratic in `delta`; a
 /// square-rooted version converges far tighter than glmnet and shifts where
 /// the path stops.
-/// Coordinate-descent convergence tolerance.
+/// Coordinate-descent convergence tolerance: MORE's own `epsilon`.
 ///
-/// MORE passes its `epsilon = 1e-5` to glmnet as `thres`, and the port used
-/// the same value. That turns out to be the one place where copying R is
-/// *worse* than not copying it. At 1e-5 neither implementation is converged:
-/// solving the identical objective to 1e-12 on both sides puts the
-/// coefficients within **3.3e-07** of each other with an identical sparsity
-/// pattern, so the port's formulation -- the elastic-net update, the `ys`
-/// rescaling, all of it -- is right. What differs at 1e-5 is only *where in
-/// the tolerance ball each solver happens to stop*, and on a
-/// cross-validation tie that is enough to pick a different alpha.
+/// **This was 1e-7 and is now 1e-5, because reproducing R's RNG removed the
+/// reason for the departure.** The old value was chosen when the port picked
+/// its collinearity-group representatives deterministically while R drew them
+/// from `sample()`. That gave the port a *different design matrix*, and 1e-7
+/// happened to compensate on the one configuration it was tuned against
+/// (mlr-denser). With the stream reproduced (`rrng`) and the design column
+/// order corrected (`model::order_like_r`), the port is handed the identical
+/// matrix in the identical order, and then copying MORE's own tolerance is
+/// straightforwardly better. Measured end to end on the real STATegra example
+/// (957 targets), port against `runMORE.R`:
 ///
-/// R's own choice is the tolerance-stable one: on the mlr-denser G12 fit R
-/// picks alpha 0.2 at 1e-5 and still at glmnet's tighter default. The port
-/// picks 0.3 at 1e-5 and 0.2 at every tolerance from 1e-6 down. Converging
-/// further therefore does not imitate R's rounding error, it removes the
-/// port's own -- and the two agree because both approach the same optimum.
+/// | tolerance | edge Jaccard | sym.diff. | identical R2 | worst coeff | seconds |
+/// | --- | --- | --- | --- | --- | --- |
+/// | 1e-7 | 0.9879 | 19 | 7/719 | 3.26e+01 | 217 |
+/// | **1e-5** | **0.9911** | **14** | **87/719** | **2.11e+00** | **25** |
 ///
-/// This is a deliberate, measured departure from the R default, and the only
-/// one on the MLR path. It costs a little time and is worth an edge set.
-pub const DESCENT_THRESH: f64 = 1e-7;
+/// Better on every axis and 9x faster, so there is no trade to make.
+///
+/// What does *not* follow is that either side is then converged. At 1e-5
+/// glmnet is measurably short of the optimum -- on one fit its objective falls
+/// 2.682616e-02 -> 2.640738e-02 as `thres` goes 1e-5 -> 1e-14, and `||b||_1`
+/// rises 9.646 -> 10.164. Worse, at 1e-5 its answer is not a function of the
+/// data: permuting the design columns, which cannot change the optimum, moves
+/// the objective by 3.0e-03 relative (against 5.4e-07 at 1e-12) and `||b||_1`
+/// across [9.5923, 9.6574].
+///
+/// That fixes the achievable acceptance bar, and it is the same one the brief
+/// already uses for stochastic paths -- inside R's own measured spread, not
+/// equal to a point in it. Comparing the port's coefficient gap against R's
+/// gap to *itself* under that neutral permutation, at alpha 0.1 / rung 81 /
+/// 1e-5:
+///
+/// | design | R vs R (median / worst) | port vs R |
+/// | --- | --- | --- |
+/// | des_01 | 4.16e-03 / 8.30e-03 | 7.55e-03 |
+/// | des_03 | 6.91e-03 / 1.01e-02 | 9.67e-03 |
+/// | des_10 | 5.45e-03 / 1.21e-02 | 5.22e-03 |
+///
+/// The port lands inside that band in all three, and below R's median in one.
+/// A tighter bar than this is not reachable by any independent implementation,
+/// only by reproducing glmnet's Fortran iterate for iterate -- which would be
+/// pinning to glmnet 5.0's arithmetic rather than to MORE's model.
+pub const DESCENT_THRESH: f64 = 1e-5;
+
+/// The coordinate-descent tolerance actually used, overridable by
+/// `MORE_RS_DESCENT_THRESH`.
+///
+/// The override exists because MORE's own `epsilon = 1e-5` leaves glmnet short
+/// of the optimum by a margin large enough to matter: measured on one fit,
+/// glmnet's objective falls from 2.682616e-02 at 1e-5 to 2.640738e-02 at 1e-14,
+/// and permuting the design columns — a semantically neutral relabelling —
+/// moves its answer by 3.0e-03 relative at 1e-5 against 5.4e-07 at 1e-12. So R
+/// at its default is not a function of the data alone, and the only way to
+/// compare the two implementations on equal terms is to be able to converge
+/// both. `runMORE.R` never passes `epsilon`, so production R is always 1e-5.
+pub fn descent_thresh() -> f64 {
+    std::env::var("MORE_RS_DESCENT_THRESH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DESCENT_THRESH)
+}
 
 /// glmnet switches to naive (residual) updates at this many variables; below
 /// it, `type.gaussian = "covariance"` is the default and the gradient is
@@ -342,7 +384,7 @@ fn folds(n: usize, k: usize) -> Vec<Vec<usize>> {
 
 /// `mynfolds` from `ElasticNet`: leave-one-out below 50 observations, then
 /// 5 / 7 / 10 as the sample count grows.
-fn n_folds(n: usize) -> usize {
+pub fn n_folds(n: usize) -> usize {
     if n < 50 {
         n
     } else if n < 100 {
@@ -373,7 +415,18 @@ fn center(x: &Mat, y: &[f64]) -> (Mat, Vec<f64>, Vec<f64>, f64) {
 
 /// Cross-validated elastic net over `alphas`, choosing the alpha with the
 /// smallest `cvm + cvsd` at its own `lambda.min` — R's `cvup` rule.
-pub fn cv_fit(x: &Mat, y: &[f64], alphas: &[f64], thresh: f64) -> Option<EnFit> {
+/// `drawn_folds`, when present, carries one R `foldid` vector per alpha, in
+/// alpha order — `cv.glmnet` draws its own folds on **every** call, so eleven
+/// alphas mean eleven independent assignments, not one shared one. `None` keeps
+/// the deterministic interleaved folds, which is what the unit tests below use
+/// and what any caller that is not reproducing an R run wants.
+pub fn cv_fit(
+    x: &Mat,
+    y: &[f64],
+    alphas: &[f64],
+    thresh: f64,
+    drawn_folds: Option<&[Vec<usize>]>,
+) -> Option<EnFit> {
     let n = x.nrow();
     let p = x.ncol();
     if n < 3 || p == 0 {
@@ -381,11 +434,20 @@ pub fn cv_fit(x: &Mat, y: &[f64], alphas: &[f64], thresh: f64) -> Option<EnFit> 
     }
     let (xc, yc, xmeans, ymean) = center(x, y);
     let k = n_folds(n);
-    let fold_sets = folds(n, k);
+    let default_sets = folds(n, k);
 
     let mut best: Option<(f64, EnFit)> = None; // (cvup, fit)
 
-    for &alpha in alphas {
+    for (ai, &alpha) in alphas.iter().enumerate() {
+        // Held-out index sets for this alpha: fold f holds every observation
+        // R labelled f.
+        let fold_sets: Vec<Vec<usize>> = match drawn_folds {
+            Some(all) => {
+                let ids = &all[ai];
+                (1..=k).map(|f| (0..n).filter(|&i| ids[i] == f).collect()).collect()
+            }
+            None => default_sets.clone(),
+        };
         // `cv.glmnet` fits the full data once to obtain the lambda sequence,
         // then hands that exact sequence to every fold. The outer fit is the
         // only one allowed to stop early, so it also fixes how many rungs
@@ -508,6 +570,63 @@ pub struct AlphaDiag {
 /// be able to drift away from the code it is measuring, and the alternative —
 /// threading an optional collector through `cv_fit` — puts test scaffolding
 /// on the hot path that every target pays for.
+/// Every rung of the CV curve at one alpha: `(lambda, cvm, cvsd, nonzero)`.
+///
+/// `cv_probe` reports only the argmin, which is exactly the wrong resolution
+/// for diagnosing an argmin that lands on a different rung than R's. Compare
+/// against `equivalence/cv_curve.R`, which prints `cv.glmnet`'s own
+/// `lambda`/`cvm`/`cvsd` for the same matrix.
+pub fn cv_curve(x: &Mat, y: &[f64], alpha: f64, thresh: f64) -> Vec<(f64, f64, f64, usize)> {
+    let n = x.nrow();
+    let p = x.ncol();
+    let mut out = Vec::new();
+    if n < 3 || p == 0 {
+        return out;
+    }
+    let (xc, yc, _, _) = center(x, y);
+    let fold_sets = folds(n, n_folds(n));
+    let grid = lambda_path(&xc, &yc, alpha, 100);
+    let full = path_fit(&xc, &yc, alpha, &grid, thresh, true);
+    let lambdas = &grid[..full.len()];
+    let mut sq: Vec<Vec<f64>> = vec![Vec::new(); lambdas.len()];
+    for held in &fold_sets {
+        let keep: Vec<usize> = (0..n).filter(|i| !held.contains(i)).collect();
+        if keep.len() < 2 {
+            continue;
+        }
+        let xt = xc.select_rows(&keep);
+        let yt: Vec<f64> = keep.iter().map(|&i| yc[i]).collect();
+        let (xt, yt, tm, tym) = center(&xt, &yt);
+        for (li, b) in path_fit(&xt, &yt, alpha, lambdas, thresh, false).iter().enumerate() {
+            for &i in held {
+                let mut pred = tym;
+                for j in 0..p {
+                    if b[j] != 0.0 {
+                        pred += b[j] * (xc.get(i, j) - tm[j]);
+                    }
+                }
+                let e = yc[i] - pred;
+                sq[li].push(e * e);
+            }
+        }
+    }
+    for (i, errs) in sq.iter().enumerate() {
+        if errs.is_empty() {
+            continue;
+        }
+        let m = errs.iter().sum::<f64>() / errs.len() as f64;
+        let var = errs.iter().map(|e| (e - m) * (e - m)).sum::<f64>()
+            / (errs.len().max(2) as f64 - 1.0);
+        out.push((
+            lambdas[i],
+            m,
+            (var / errs.len() as f64).sqrt(),
+            full[i].iter().filter(|b| **b != 0.0).count(),
+        ));
+    }
+    out
+}
+
 pub fn cv_probe(x: &Mat, y: &[f64], alphas: &[f64], thresh: f64) -> Vec<AlphaDiag> {
     let n = x.nrow();
     let p = x.ncol();
@@ -653,21 +772,21 @@ mod tests {
     #[test]
     fn cross_validation_selects_the_driving_predictor() {
         let (x, y) = design(24);
-        let fit = cv_fit(&x, &y, &default_alphas(), 1e-7).expect("fit");
+        let fit = cv_fit(&x, &y, &default_alphas(), 1e-7, None).expect("fit");
         assert!(fit.coefficients[0].abs() > 1e-6, "driver not selected: {:?}", fit.coefficients);
     }
 
     #[test]
     fn an_unrelated_predictor_is_shrunk_far_below_the_driver() {
         let (x, y) = design(24);
-        let fit = cv_fit(&x, &y, &default_alphas(), 1e-7).expect("fit");
+        let fit = cv_fit(&x, &y, &default_alphas(), 1e-7, None).expect("fit");
         assert!(fit.coefficients[0].abs() > 10.0 * fit.coefficients[1].abs());
     }
 
     #[test]
     fn a_good_fit_reports_a_high_dev_ratio() {
         let (x, y) = design(24);
-        let fit = cv_fit(&x, &y, &default_alphas(), 1e-7).expect("fit");
+        let fit = cv_fit(&x, &y, &default_alphas(), 1e-7, None).expect("fit");
         assert!(fit.dev_ratio > 0.9, "dev_ratio was {}", fit.dev_ratio);
     }
 
@@ -677,7 +796,7 @@ mod tests {
         for v in y.iter_mut() {
             *v += 7.0;
         }
-        let fit = cv_fit(&x, &y, &default_alphas(), 1e-7).expect("fit");
+        let fit = cv_fit(&x, &y, &default_alphas(), 1e-7, None).expect("fit");
         assert!((fit.intercept - 7.0).abs() < 0.5, "intercept {}", fit.intercept);
     }
 
@@ -693,8 +812,8 @@ mod tests {
     fn refitting_the_same_data_gives_the_same_answer() {
         // Deterministic folds mean no run-to-run variation at all, unlike R.
         let (x, y) = design(24);
-        let a = cv_fit(&x, &y, &default_alphas(), 1e-7).unwrap();
-        let b = cv_fit(&x, &y, &default_alphas(), 1e-7).unwrap();
+        let a = cv_fit(&x, &y, &default_alphas(), 1e-7, None).unwrap();
+        let b = cv_fit(&x, &y, &default_alphas(), 1e-7, None).unwrap();
         assert_eq!(a.coefficients, b.coefficients);
         assert_eq!(a.lambda, b.lambda);
     }

@@ -16,6 +16,7 @@ mod model;
 mod output;
 mod pls;
 mod prep;
+mod rrng;
 
 #[cfg(test)]
 mod oracle_test;
@@ -66,6 +67,19 @@ fn en_probe(path: &str) -> ExitCode {
     }
     let x = matrix::Mat::from_columns(&cols);
     println!("   probe {} x {}", x.nrow(), x.ncol());
+    if let Ok(a) = std::env::var("MORE_RS_CV_CURVE") {
+        let alpha: f64 = a.parse().unwrap_or(0.1);
+        let t: f64 = std::env::var("MORE_RS_EN_THRESH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(elasticnet::DESCENT_THRESH);
+        for (i, (lam, cvm, cvsd, nz)) in
+            elasticnet::cv_curve(&x, &y, alpha, t).iter().enumerate()
+        {
+            println!("   {:3} lambda={:.10e} cvm={:.10e} cvsd={:.10e} nz={}", i + 1, lam, cvm, cvsd, nz);
+        }
+        return ExitCode::SUCCESS;
+    }
     if let Ok(a) = std::env::var("MORE_RS_EN_PATH") {
         let alpha: f64 = a.parse().unwrap_or(1.0);
         let t: f64 = std::env::var("MORE_RS_EN_THRESH")
@@ -269,6 +283,7 @@ fn run(opts: &Options) -> Result<(), String> {
         omics.push(Omic {
             name: opts.omic_names[i].clone(),
             data: data_final,
+            input_data: frame,
             associations: assoc_per_omic[i].clone(),
             omic_type,
             removed_na,
@@ -301,6 +316,7 @@ fn run(opts: &Options) -> Result<(), String> {
     // --- fit ---------------------------------------------------------------
     let params =
         model::FitParams {
+            seed: opts.seed,
             alpha: opts.alpha,
             vip: opts.vip,
             interactions: opts.interactions,
@@ -322,9 +338,9 @@ fn run(opts: &Options) -> Result<(), String> {
     );
 
     for omic in &omics {
-        let full = output::full_pairs(omic);
         let sig = output::significant_pairs(&results, &omic.name);
-        output::write_omic_files(dir, &opts.date_seed, &omic.name, &full, &sig, &omic.data)?;
+        let full = output::full_pairs(omic, &sig);
+        output::write_omic_files(dir, &opts.date_seed, &omic.name, &full, &sig, &omic.input_data)?;
         println!(
             "MORE: {} — wrote {} pairs to values file ({} significant for yellow stars)",
             omic.name,

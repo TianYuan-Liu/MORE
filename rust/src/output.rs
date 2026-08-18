@@ -218,9 +218,14 @@ pub fn format_r_double(v: f64) -> String {
     }
     const P: i32 = 15;
     let e = v.abs().log10().floor() as i32;
-    let mut s = if e < -5 || e >= P {
-        let mantissa_digits = (P - 1).max(0) as usize;
-        let formatted = format!("{:.*e}", mantissa_digits, v);
+
+    // R renders both forms at 15 significant digits and keeps the shorter one,
+    // preferring fixed on a tie (`scipen = 0`). It is NOT a threshold on the
+    // exponent: 0.001 and 0.00012345 tie and stay fixed, while 7.255e-05 and
+    // 1e+05 -- one either side of the range a threshold would cover -- both go
+    // scientific because they come out a character shorter.
+    let scientific = {
+        let formatted = format!("{:.*e}", (P - 1).max(0) as usize, v);
         // Rust writes `1.5e-7`; R writes `1.5e-07`.
         match formatted.split_once('e') {
             Some((m, exp)) => {
@@ -234,10 +239,10 @@ pub fn format_r_double(v: f64) -> String {
             }
             None => formatted,
         }
-    } else {
-        let decimals = (P - 1 - e).max(0) as usize;
-        trim_zeros(&format!("{:.*}", decimals, v))
     };
+    let fixed = trim_zeros(&format!("{:.*}", (P - 1 - e).max(0) as usize, v));
+
+    let mut s = if scientific.len() < fixed.len() { scientific } else { fixed };
     if s == "-0" {
         s = "0".into();
     }
@@ -352,13 +357,28 @@ pub fn write_omic_files(
     write_lines(&values_path, &lines)
 }
 
-/// Every input pair whose regulator survives into the regulator matrix.
-pub fn full_pairs(omic: &crate::prep::Omic) -> Vec<(String, String)> {
+/// Every input pair whose regulator is present in the omic's **input** matrix.
+///
+/// Membership is tested against `input_data`, never `data`: R resolves this set
+/// with `assoc_df$regulator %in% rownames(regulatoryData[[name]])`, and that
+/// matrix keeps the regulators MORE's high-NA and low-variation filters exclude
+/// from the fit.
+///
+/// With **no association file** there is no input pair set to snapshot, and R
+/// falls back to MORE's own significant pairs rather than writing nothing --
+/// `significant` is that fallback. The job reaches here whenever an omic was
+/// submitted without associations, which PaintOmics allows: MOREServlet sends
+/// the literal `NULL` for it. Returning an empty set instead hands PA Step 1 an
+/// omic with no `GENE:::REGULATOR` features at all.
+pub fn full_pairs(
+    omic: &crate::prep::Omic,
+    significant: &[(String, String)],
+) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     match &omic.associations {
         Some(rows) => {
             for a in rows {
-                if omic.data.row_names.contains(&a.regulator) {
+                if omic.input_data.row_names.contains(&a.regulator) {
                     let pair = (a.target.clone(), a.regulator.clone());
                     if !out.contains(&pair) {
                         out.push(pair);
@@ -366,7 +386,15 @@ pub fn full_pairs(omic: &crate::prep::Omic) -> Vec<(String, String)> {
                 }
             }
         }
-        None => {}
+        None => {
+            // R applies unique() to the fallback; the significance scan can
+            // repeat a pair across conditions.
+            for pair in significant {
+                if !out.contains(pair) {
+                    out.push(pair.clone());
+                }
+            }
+        }
     }
     out
 }
@@ -530,6 +558,39 @@ mod tests {
     #[test]
     fn missing_values_are_written_as_nan_for_the_python_validator() {
         assert_eq!(format_r_double(f64::NAN), "NaN");
+    }
+
+    #[test]
+    fn r_picks_whichever_of_fixed_and_scientific_is_shorter() {
+        // Oracle: as.character(x) under R 4.6.0, default scipen = 0. R does not
+        // switch at a fixed exponent -- it renders both forms at 15 significant
+        // digits and takes the shorter, keeping fixed on a tie. A threshold rule
+        // gets the near-boundary values wrong in both directions.
+        for (value, expected) in [
+            (7.255e-05_f64, "7.255e-05"),   // sci is 9 chars, fixed is 10
+            (4.822e-05, "4.822e-05"),
+            (9.999e-05, "9.999e-05"),
+            (1e-04, "1e-04"),               // 5 vs 6
+            (1.5e-07, "1.5e-07"),
+            (0.00693, "0.00693"),           // fixed is 7, sci is 8
+            (0.001, "0.001"),               // 5 vs 5 -- tie keeps fixed
+            (0.00012345, "0.00012345"),     // 10 vs 10 -- tie keeps fixed
+            (0.000123456789, "0.000123456789"),
+            (0.1, "0.1"),
+            (100000.0, "1e+05"),            // 5 vs 6 -- large side switches too
+            (1e15, "1e+15"),
+            (1e16, "1e+16"),
+            (123456.0, "123456"),
+            (1234567890123456.0, "1234567890123456"),
+        ] {
+            assert_eq!(format_r_double(value), expected, "for {value:e}");
+        }
+    }
+
+    #[test]
+    fn the_sign_does_not_change_which_form_r_picks() {
+        assert_eq!(format_r_double(-7.255e-05), "-7.255e-05");
+        assert_eq!(format_r_double(-0.00693), "-0.00693");
     }
 
     #[test]
