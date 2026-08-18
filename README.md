@@ -1,6 +1,30 @@
 # MORE
 MORE (Multi-Omics REgulation) is an R package for the application of Partial Least Squares (PLS) or Multiple Linear Regression (MLR) models with Elastic Net or Iterative Sparse Group Lasso (ISGL) regularizations to multi-omics data. The MORE method applies MLRs or PLS to model a target omic expression as a function of experimental variables, such as diseases or treatments, and the potential regulators of that given target feature. The aim is to obtain specific candidate regulators for the biological system under study.
 
+> ### This fork also contains a Rust port of the modelling kernel
+>
+> `rust/` holds **`more-rs`**, a reimplementation of MORE's per-target modelling
+> kernel that is a drop-in at PaintOmics' `runMORE.R` seam — same options, same
+> output files. It exists because it is much faster (PLS1 by a few hundred
+> times, MLR by roughly an order of magnitude) and because it is a single static
+> binary, so it runs on deployment images that have neither R nor MORE installed.
+>
+> **PLS1 is byte-identical to R.** **MLR reproduces every one of R's random
+> draws** — the port implements R's own Mersenne-Twister, `set.seed` scrambling
+> and `R_unif_index` rejection sampling, so the collinearity-group
+> representatives that `sample()` picks match exactly (0 of 1555 wrong on a real
+> 957-target dataset, 8157 of 8157 draws identical). Coefficient *values* still
+> differ slightly, and that is a property of the reference rather than the port:
+> MORE runs `glmnet` at `epsilon = 1e-5`, where coordinate descent has not
+> converged and where permuting the design columns — which cannot move the
+> optimum — already shifts glmnet's own answer by more than the port differs
+> from it.
+>
+> The R sources in `R/` are the oracle and are never edited. See
+> [`rust/README.md`](rust/README.md) for how the RNG reproduction works and how
+> to verify it, `rust/SPEC.md` for the line-by-line specification, and
+> `rust/BUILD.md` for building and the debugging hooks.
+
 ## Installation
 
 ### Prerequisites
