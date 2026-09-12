@@ -131,6 +131,52 @@ pub fn format_r_number(v: f64) -> String {
     }
 }
 
+/// The distinct condition labels, in the alphabetical order `model.matrix`
+/// would give the factor levels.
+pub fn condition_levels(groups: &[String]) -> Vec<&str> {
+    let set: std::collections::BTreeSet<&str> = groups.iter().map(String::as_str).collect();
+    set.into_iter().collect()
+}
+
+/// Why this experimental design cannot be modelled, if it cannot.
+///
+/// MORE fits `target ~ Group + Group:Regulator`, so it needs at least two
+/// condition groups to contrast. With one group the two methods do not even
+/// agree with each other on what to produce -- `design_columns` hands PLS1 a
+/// single constant column of 1s and hands MLR nothing at all once the
+/// reference level is dropped -- and the port used to exit 0 on both: PLS1
+/// with an empty table, MLR with 887 "regulations per condition" from a
+/// design with no condition contrast in it. At least one of those is wrong
+/// and nothing validates either, because the R reference refuses the input
+/// outright (`contrasts can be applied only to factors with 2 or more
+/// levels`, from `model.matrix`).
+///
+/// Refusing is deliberate rather than a port of R's error. A one-group run
+/// reduces to plain regression of the target on its regulators, which is a
+/// meaningful model MORE does not currently offer; inventing it here would
+/// ship statistics no oracle has ever checked. A design file with a single
+/// group is also, in practice, a user who meant to upload their conditions
+/// and did not.
+pub fn design_problem(groups: &[String]) -> Option<String> {
+    if groups.is_empty() {
+        return Some(
+            "The experimental design file has no samples in common with the data files."
+                .to_string(),
+        );
+    }
+    let levels = condition_levels(groups);
+    if levels.len() < 2 {
+        return Some(format!(
+            "The experimental design has only one condition group ({}). MORE compares \
+             regulation between conditions, so it needs at least two groups. Check that \
+             the design file has one column per condition and that each sample is assigned \
+             to the right one.",
+            levels.first().copied().unwrap_or("unnamed")
+        ));
+    }
+    None
+}
+
 /// `model.matrix` column names, in R's factor-level order (alphabetical),
 /// prefixed `Group_`.
 ///
@@ -374,6 +420,40 @@ mod tests {
     fn a_suffix_in_the_middle_is_left_alone() {
         assert_eq!(mangle_id("TF_راw"), "TF_راw");
         assert_eq!(mangle_id("A_Rb"), "A_Rb");
+    }
+
+    #[test]
+    fn two_condition_groups_are_modellable() {
+        let groups = vec!["1_0".to_string(), "1_0".to_string(), "0_1".to_string()];
+        assert_eq!(design_problem(&groups), None);
+        assert_eq!(condition_levels(&groups), vec!["0_1", "1_0"]);
+    }
+
+    /// The whole point of the guard: one group is not a contrast, and both
+    /// methods used to accept it and disagree with each other about what it
+    /// meant -- PLS1 an empty table, MLR 887 rows.
+    #[test]
+    fn one_condition_group_is_refused_and_named() {
+        let groups = vec!["1".to_string(), "1".to_string(), "1".to_string()];
+        let problem = design_problem(&groups).expect("one group must be refused");
+        assert!(problem.contains("only one condition group"), "{problem}");
+        assert!(problem.contains("(1)"), "the group is named: {problem}");
+    }
+
+    #[test]
+    fn no_samples_at_all_is_refused() {
+        let problem = design_problem(&[]).expect("an empty design must be refused");
+        assert!(problem.contains("no samples in common"), "{problem}");
+    }
+
+    /// The reference level MLR drops must not be what makes a design look
+    /// single-group: two groups stay two groups here, and `design_columns`
+    /// dropping one of them afterwards is a separate, legitimate step.
+    #[test]
+    fn the_guard_runs_before_the_reference_level_is_dropped() {
+        let groups = vec!["1_0".to_string(), "0_1".to_string()];
+        assert_eq!(design_problem(&groups), None);
+        assert_eq!(design_columns(&groups, true).len(), 1);
     }
 
     #[test]
