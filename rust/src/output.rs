@@ -371,10 +371,13 @@ pub fn write_omic_files(
     write_lines(&assoc_path, &assoc)?;
 
     let pairs_path = dir.join(format!("MORE_relevant_pairs_{omic}_{seed}.tab"));
+    // Same shape as full_pairs: order-preserving dedup, but the membership
+    // test is a set rather than a scan over everything written so far.
     let mut seen = Vec::new();
+    let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (t, r) in significant_pairs {
         let key = format!("{t}:::{}", unprefix(r, prefix));
-        if !seen.contains(&key) {
+        if written.insert(key.clone()) {
             seen.push(key);
         }
     }
@@ -416,15 +419,31 @@ pub fn full_pairs(
     omic: &crate::prep::Omic,
     significant: &[(String, String)],
 ) -> Vec<(String, String)> {
+    // Insertion order is the output order and R's `unique()` keeps first
+    // appearance, so the Vec stays; the set beside it only answers "seen
+    // already". Both membership tests used to be linear scans -- one over
+    // every regulator per association row, one over the growing result per row
+    // -- which is O(rows^2) and dominated the whole run long before the model
+    // did. Measured on 30 regulators/gene, PLS1, before this change:
+    //
+    //     500 genes  0.60 s   1.20 ms/gene      4000 genes  16.01 s  4.00
+    //    1000        1.57     1.57              8000        57.72    7.21
+    //    2000        4.77     2.38
+    //
+    // a clean ~4x per doubling. The per-gene cost is supposed to be flat: the
+    // cost model that decides whether a job may run at all extrapolates along
+    // this axis and calls it "safe".
+    let known: std::collections::HashSet<&str> =
+        omic.input_data.row_names.iter().map(String::as_str).collect();
     let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
     match &omic.associations {
         Some(rows) => {
             for a in rows {
-                if omic.input_data.row_names.contains(&a.regulator) {
-                    let pair = (a.target.clone(), a.regulator.clone());
-                    if !out.contains(&pair) {
-                        out.push(pair);
-                    }
+                if known.contains(a.regulator.as_str())
+                    && seen.insert((a.target.as_str(), a.regulator.as_str()))
+                {
+                    out.push((a.target.clone(), a.regulator.clone()));
                 }
             }
         }
@@ -432,7 +451,7 @@ pub fn full_pairs(
             // R applies unique() to the fallback; the significance scan can
             // repeat a pair across conditions.
             for pair in significant {
-                if !out.contains(pair) {
+                if seen.insert((pair.0.as_str(), pair.1.as_str())) {
                     out.push(pair.clone());
                 }
             }
