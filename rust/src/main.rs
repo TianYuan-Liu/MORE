@@ -168,6 +168,20 @@ fn run(opts: &Options) -> Result<(), String> {
     }
 
     // --- ID mangling and collision prefixing (GetPLS:120-158) -------------
+    //
+    // The regulator ids AS THE USER WROTE THEM, kept before anything rewrites
+    // them. `read_associations` decides which column holds the regulator by
+    // counting matches against this list, and the association file on disk
+    // still holds the user's spelling -- so orientation has to be judged on
+    // that spelling. Handing it the rewritten names instead made the match
+    // count zero in both columns and aborted the job, on two ordinary inputs:
+    // a regulator id that is also a target id (a TF is itself a gene), and any
+    // id containing ":" (peak and region ids, which `mangle_id` rewrites to
+    // "-"). R does not have the problem because runMORE.R orients the file
+    // before more() rewrites anything, and MORE_PLS.R:229-234 then applies the
+    // same gsub to `associations[[i]][[2]]` and to the rownames together.
+    let raw_regulator_ids: Vec<Vec<String>> =
+        raw_omics.iter().map(|f| f.row_names.clone()).collect();
     for f in raw_omics.iter_mut() {
         for name in f.row_names.iter_mut() {
             *name = prep::mangle_id(name);
@@ -197,6 +211,20 @@ fn run(opts: &Options) -> Result<(), String> {
             }
         }
     }
+    // Which omics actually carry a prefix, so the writers can take it off
+    // again. The prefix is internal disambiguation: R removes it before
+    // writing (output_analysis.R:414-416), and PaintOmics matches the user's
+    // significant-regulator file against the half of `GENE:::REGULATOR` after
+    // the separator (MOREServlet.py:1219), so a prefix left in the output
+    // silently drops every red star for that omic while the job still reports
+    // success.
+    let omic_prefixes: HashMap<String, String> = opts
+        .omic_names
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| prefix_needed[*i])
+        .map(|(_, name)| (name.clone(), format!("{name}-")))
+        .collect();
 
     // --- associations ------------------------------------------------------
     let mut assoc_per_omic: Vec<Option<Vec<data::Association>>> = Vec::new();
@@ -213,7 +241,7 @@ fn run(opts: &Options) -> Result<(), String> {
                 let mut rows = data::read_associations(
                     p,
                     &opts.omic_names[i],
-                    &raw_omics[i].row_names,
+                    &raw_regulator_ids[i],
                     &target.row_names,
                 )?;
                 // Association regulator IDs get the same mangling and prefixing
@@ -330,7 +358,14 @@ fn run(opts: &Options) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
     let rows = output::rpc_table(&results, &target, &rpc_cols, opts.filter_r2);
-    output::write_rpc(dir, &opts.date_seed, &rows, &rpc_cols, opts.method == Method::Mlr)?;
+    output::write_rpc(
+        dir,
+        &opts.date_seed,
+        &rows,
+        &rpc_cols,
+        opts.method == Method::Mlr,
+        &omic_prefixes,
+    )?;
     println!(
         "MORE: wrote RegulationPerCondition table ({} rows) to MORE_rpc_{}.tab",
         rows.len(),
@@ -338,9 +373,24 @@ fn run(opts: &Options) -> Result<(), String> {
     );
 
     for omic in &omics {
-        let sig = output::significant_pairs(&results, &omic.name);
+        // `filter_r2` gates the yellow stars as well as the table. R derives
+        // the pairs file FROM the already-filtered RegulationPerCondition
+        // (runMORE.R:584-591), so a target the R2 filter drops must not
+        // contribute stars either. Passing it only to `rpc_table` left the
+        // pathway map starring regulators with no row behind them: at
+        // --filter_r2 0.9 on one fixture R wrote 4 pairs and the port wrote
+        // 217.
+        let sig = output::significant_pairs(&results, &omic.name, opts.filter_r2);
         let full = output::full_pairs(omic, &sig);
-        output::write_omic_files(dir, &opts.date_seed, &omic.name, &full, &sig, &omic.input_data)?;
+        output::write_omic_files(
+            dir,
+            &opts.date_seed,
+            &omic.name,
+            &full,
+            &sig,
+            &omic.input_data,
+            omic_prefixes.get(&omic.name).map(String::as_str),
+        )?;
         println!(
             "MORE: {} — wrote {} pairs to values file ({} significant for yellow stars)",
             omic.name,
