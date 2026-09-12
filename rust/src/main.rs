@@ -274,6 +274,11 @@ fn run(opts: &Options) -> Result<(), String> {
     let kept_samples = target.col_names.clone();
     let condition = condition.select_rows(&kept_samples);
     let groups = prep::group_labels(&condition);
+    // A design with nothing to contrast is refused here rather than modelled.
+    // See prep::design_problem for why it is refused and not reinterpreted.
+    if let Some(problem) = prep::design_problem(&groups) {
+        return Err(problem);
+    }
     // MLR drops the reference level; PLS1 keeps every level. See prep::design_columns.
     let design_cols = prep::design_columns(&groups, opts.method == Method::Mlr);
     let design_values = prep::design_matrix(&groups, &design_cols);
@@ -352,6 +357,55 @@ fn run(opts: &Options) -> Result<(), String> {
             correlation: 0.7,
         };
     let results = model::fit_all(&targets, &target, &omics, &design_cols, &design_values, &params);
+
+    // --- did anything actually fit? ---------------------------------------
+    //
+    // Every target that fails to produce a model already records why, per
+    // target, honestly. What was missing is anyone reading those records:
+    // `rpc_table` drops a target with no model exactly the way it drops a
+    // target whose model found nothing, so a run where *no* target fitted at
+    // all still printed "Analysis complete." and exited 0 over a 0-byte table.
+    //
+    // Reachable by uploading regulatory data with missing values in it. The
+    // two `PERC_NA` filters are per regulator and per sample, so one NA per
+    // regulator spread across the samples passes both; the NAs then reach the
+    // design matrix and `pls::fit` returns `None` for every target. Measured
+    // on a 120-target fixture: 120 x "No significant components on PLS" on the
+    // PLS1 path, 120 x "No model could be fitted" on the MLR path, exit 0 in
+    // both. R stops with an error on the same input.
+    //
+    // The test is "did any target get a model", not "did any target get a
+    // significant regulator". A dataset with no real signal fits fine and
+    // reports nothing, and that is a legitimate, successful answer.
+    let fitted = results.iter().filter(|r| r.r2.is_some()).count();
+    if !results.is_empty() {
+        println!(
+            "MORE: {} of {} target features produced a model.",
+            fitted,
+            results.len()
+        );
+    }
+    if !results.is_empty() && fitted == 0 {
+        let mut tally: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for r in &results {
+            *tally.entry(r.problem.unwrap_or("Unknown")).or_default() += 1;
+        }
+        let reasons = tally
+            .iter()
+            .map(|(reason, n)| format!("{n} x {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "None of the {} target features produced a model, so there is nothing to report: \
+             {reasons}. The usual cause is missing or infinite values in the regulatory data. \
+             A regulator is kept whenever no more than {:.0}% of its samples are NA, and an \
+             infinite value is not counted as missing at all, so either kind carries through \
+             into every model from there. Check the regulatory data and either impute the \
+             offending values or drop the regulators that carry them.",
+            results.len(),
+            prep::PERC_NA * 100.0
+        ));
+    }
 
     // --- write -------------------------------------------------------------
     let dir = Path::new(&opts.output_dir);
