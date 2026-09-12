@@ -177,6 +177,31 @@ fn rpc_rows_for(result: &TargetResult, design_cols: &[String], target_sd: f64) -
 }
 
 /// Build the whole rpc table, honouring `--filter_r2`.
+/// The `--filter_r2` gate, in one place so the table and the pairs file cannot
+/// drift apart.
+///
+/// R applies it once, to `RegulationPerCondition`, and then derives the
+/// yellow-star pairs file from that filtered table (runMORE.R:584-591). Two
+/// separate copies of the predicate is how the port came to filter the table
+/// and not the stars.
+fn passes_r2(result: &TargetResult, filter_r2: f64) -> bool {
+    matches!(result.r2, Some(r2) if r2 > filter_r2)
+}
+
+/// Undo the `<omic>-` disambiguation prefix for display.
+///
+/// Exact rather than heuristic: the port applied the prefix itself, to every
+/// regulator of the omics in `prefix`, so removing exactly one is its inverse.
+/// `runMORE.R`'s `strip_omic_prefix` has to guess -- it never saw the
+/// prefixing happen, so it refuses to strip a value that is itself a real
+/// regulator id, to avoid turning a genuine "TF-1" into "1".
+fn unprefix<'a>(name: &'a str, prefix: Option<&str>) -> &'a str {
+    match prefix {
+        Some(p) => name.strip_prefix(p).unwrap_or(name),
+        None => name,
+    }
+}
+
 pub fn rpc_table(
     results: &[TargetResult],
     target_data: &Frame,
@@ -186,11 +211,7 @@ pub fn rpc_table(
     let index = target_data.row_index();
     let mut out = Vec::new();
     for result in results {
-        if let Some(r2) = result.r2 {
-            if !(r2 > filter_r2) {
-                continue;
-            }
-        } else {
+        if !passes_r2(result, filter_r2) {
             continue;
         }
         let sd = index
@@ -276,6 +297,9 @@ pub fn write_rpc(
     // "representative" column; the PLS branch drops it with myresults[, -5]
     // (output_analysis.R:410). Same table, different width by method.
     representative: bool,
+    // Omic name -> the "<omic>-" prefix that omic's regulators carry, for the
+    // omics that needed disambiguating. Empty when nothing collided.
+    prefixes: &HashMap<String, String>,
 ) -> Result<(), String> {
     let path = dir.join(format!("MORE_rpc_{seed}.tab"));
     if rows.is_empty() {
@@ -295,16 +319,24 @@ pub fn write_rpc(
 
     let mut lines = vec![header.join("\t")];
     for row in rows {
+        let prefix = prefixes.get(&row.omic).map(String::as_str);
         let mut fields = vec![
             row.target.clone(),
-            row.regulator.clone(),
+            unprefix(&row.regulator, prefix).to_string(),
             row.omic.clone(),
             row.area.clone(),
         ];
         if representative {
             // R names the representative's real regulator ID here and leaves
             // it blank for a regulator in no group (filter == "Model").
-            fields.push(row.representative.clone());
+            //
+            // Deliberate divergence from R: R's gsub strips the prefix from
+            // `regulator` only (output_analysis.R:414-416), so it prints a
+            // prefixed id in this column. PaintOmics renders it verbatim in a
+            // user-facing grid ("Representative", PA_Step3Views.js:7506) and
+            // never joins on it, so leaving the prefix shows the user an id
+            // that does not exist while stripping it cannot break a lookup.
+            fields.push(unprefix(&row.representative, prefix).to_string());
         }
         fields.extend(row.betas.iter().map(|b| format_r_double(*b)));
         // na = "" in write.table.
@@ -324,16 +356,24 @@ pub fn write_omic_files(
     full_pairs: &[(String, String)],
     significant_pairs: &[(String, String)],
     reg_data: &Frame,
+    // The "<omic>-" prefix this omic's regulators carry, if it needed one. The
+    // files below are the user's copy of their own data, so the ids in them
+    // must be the ids the user supplied -- `reg_data` is still keyed on the
+    // prefixed form, so the lookup below uses `r` and only the printed text is
+    // un-prefixed.
+    prefix: Option<&str>,
 ) -> Result<(), String> {
     let assoc_path = dir.join(format!("MORE_relevant_assoc_{omic}_{seed}.tab"));
-    let assoc: Vec<String> =
-        full_pairs.iter().map(|(t, r)| format!("{t}\t{r}")).collect();
+    let assoc: Vec<String> = full_pairs
+        .iter()
+        .map(|(t, r)| format!("{t}\t{}", unprefix(r, prefix)))
+        .collect();
     write_lines(&assoc_path, &assoc)?;
 
     let pairs_path = dir.join(format!("MORE_relevant_pairs_{omic}_{seed}.tab"));
     let mut seen = Vec::new();
     for (t, r) in significant_pairs {
-        let key = format!("{t}:::{r}");
+        let key = format!("{t}:::{}", unprefix(r, prefix));
         if !seen.contains(&key) {
             seen.push(key);
         }
@@ -352,7 +392,9 @@ pub fn write_omic_files(
         };
         let vals: Vec<String> =
             reg_data.values[row].iter().map(|v| format_r_double(*v)).collect();
-        lines.push(format!("{t}:::{r}\t{}", vals.join("\t")));
+        // Keyed the same way as the pairs file, or Job.parseGeneBasedFiles
+        // cannot match a values row to its pair.
+        lines.push(format!("{t}:::{}\t{}", unprefix(r, prefix), vals.join("\t")));
     }
     write_lines(&values_path, &lines)
 }
@@ -400,9 +442,16 @@ pub fn full_pairs(
 }
 
 /// Significant (target, regulator) pairs for one omic.
-pub fn significant_pairs(results: &[TargetResult], omic: &str) -> Vec<(String, String)> {
+pub fn significant_pairs(
+    results: &[TargetResult],
+    omic: &str,
+    filter_r2: f64,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for r in results {
+        if !passes_r2(r, filter_r2) {
+            continue;
+        }
         for reg in &r.significant {
             let belongs = r
                 .regulators
@@ -597,7 +646,7 @@ mod tests {
     fn the_rpc_file_is_created_even_with_no_rows() {
         let dir = std::env::temp_dir().join(format!("more_rs_rpc_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        write_rpc(&dir, "seed", &[], &groups(), false).unwrap();
+        write_rpc(&dir, "seed", &[], &groups(), false, &HashMap::new()).unwrap();
         let p = dir.join("MORE_rpc_seed.tab");
         assert!(p.exists());
         assert_eq!(fs::read_to_string(&p).unwrap(), "");
@@ -616,7 +665,7 @@ mod tests {
             betas: vec![1.0, 2.0],
             r2: Some(0.9),
         }];
-        write_rpc(&dir, "seed", &rows, &groups(), false).unwrap();
+        write_rpc(&dir, "seed", &rows, &groups(), false, &HashMap::new()).unwrap();
         let text = fs::read_to_string(dir.join("MORE_rpc_seed.tab")).unwrap();
         let mut lines = text.lines();
         assert_eq!(lines.next().unwrap(), "targetF\tregulator\tomic\tarea\tGroup_A\tGroup_B\tR2");
@@ -639,6 +688,7 @@ mod tests {
             &[("G1".to_string(), "R1".to_string())],
             &[("G1".to_string(), "R1".to_string())],
             &data,
+            None,
         )
         .unwrap();
         let pairs = fs::read_to_string(dir.join("MORE_relevant_pairs_TF_seed.tab")).unwrap();
